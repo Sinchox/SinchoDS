@@ -23,6 +23,12 @@ import {
   prioritizeChildSitemaps,
   SitemapErrorType,
 } from './src/utils/sitemap.js';
+import {
+  handleBootstrapWorkspace,
+  handleClaimLegacyWorkspace,
+  getWorkspaceConfig,
+} from './src/server/workspace.js';
+import { workspaceRouter } from './src/server/workspaceRoutes.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -34,25 +40,34 @@ app.use(express.json({ limit: '25mb' }));
 
 const USER_AGENT = 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_4 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Mobile/15E148 Safari/604.1';
 
-// In-memory token storage (also saved to Supabase / settings)
-let ebayTokenState: {
-  accessToken: string | null;
-  refreshToken: string | null;
-  expiresAt: number | null;
-  environment: 'PRODUCTION' | 'SANDBOX';
-  sellerUsername: string | null;
-} = {
-  accessToken: null,
-  refreshToken: null,
-  expiresAt: null,
-  environment: 'PRODUCTION',
-  sellerUsername: null,
-};
-
 // Health check
 app.get('/api/health', (_req, res) => {
   res.json({ status: 'ok', time: new Date().toISOString() });
 });
+
+// ==============================================================================
+// Multi-Workspace Secure Management Endpoints (Phase 1.1)
+// ==============================================================================
+
+// 1. User workspace bootstrap (idempotent, isolated per user)
+app.post('/api/workspaces/bootstrap', handleBootstrapWorkspace);
+
+// 2. Controlled legacy workspace claim (service-role only, strict server secret validation)
+app.post('/api/workspaces/claim-legacy', handleClaimLegacyWorkspace);
+
+// 3. Operational workspace configuration status (never leaks secrets)
+app.get('/api/workspaces/status', (_req, res) => {
+  const config = getWorkspaceConfig();
+  res.json({
+    ok: true,
+    supabaseConfigured: Boolean(config.supabaseUrl),
+    serviceRoleConfigured: Boolean(config.serviceRoleKey),
+    legacyClaimConfigured: Boolean(config.legacyClaimSecret),
+  });
+});
+
+// Mount secure workspace-scoped router (Products, Suppliers, eBay, Orders, History)
+app.use('/api', workspaceRouter);
 
 // Parse HTML directly
 app.post('/api/parse-html', (req, res) => {
@@ -534,218 +549,8 @@ app.get('/api/ebay/auth-url', (req, res) => {
   res.json({ ok: true, authUrl });
 });
 
-// 2. Exchange OAuth Code for Tokens
-app.post('/api/ebay/exchange-code', async (req, res) => {
-  try {
-    const { code, clientId, clientSecret, ruName, environment } = req.body;
-
-    if (!code || !clientId || !clientSecret || !ruName) {
-      return res.status(400).json({
-        ok: false,
-        error: 'All parameters (code, clientId, clientSecret, ruName) are required.',
-      });
-    }
-
-    const env = (environment || 'PRODUCTION').toUpperCase();
-    const tokenEndpoint = env === 'SANDBOX'
-      ? 'https://api.sandbox.ebay.com/identity/v1/oauth2/token'
-      : 'https://api.ebay.com/identity/v1/oauth2/token';
-
-    const basicAuth = Buffer.from(`${clientId}:${clientSecret}`).toString('base64');
-
-    const params = new URLSearchParams();
-    params.append('grant_type', 'authorization_code');
-    params.append('code', code);
-    params.append('redirect_uri', ruName);
-
-    const tokenRes = await fetch(tokenEndpoint, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/x-www-form-urlencoded',
-        'Authorization': `Basic ${basicAuth}`,
-      },
-      body: params.toString(),
-    });
-
-    const tokenData = await tokenRes.json();
-
-    if (!tokenRes.ok) {
-      return res.status(tokenRes.status).json({
-        ok: false,
-        error: tokenData.error_description || tokenData.error || 'eBay token exchange error',
-      });
-    }
-
-    ebayTokenState = {
-      accessToken: tokenData.access_token,
-      refreshToken: tokenData.refresh_token,
-      expiresAt: Date.now() + (tokenData.expires_in || 7200) * 1000,
-      environment: env as any,
-      sellerUsername: 'Connected eBay Account',
-    };
-
-    res.json({
-      ok: true,
-      connected: true,
-      expiresIn: tokenData.expires_in,
-    });
-  } catch (err: any) {
-    res.status(500).json({ ok: false, error: err.message || 'Error during token exchange' });
-  }
-});
-
-// 3. Check eBay Status
-app.get('/api/ebay/status', (_req, res) => {
-  const isTokenValid = Boolean(
-    ebayTokenState.accessToken &&
-    ebayTokenState.expiresAt &&
-    ebayTokenState.expiresAt > Date.now()
-  );
-
-  res.json({
-    connected: isTokenValid,
-    environment: ebayTokenState.environment,
-    sellerUsername: ebayTokenState.sellerUsername,
-    expiresAt: ebayTokenState.expiresAt ? new Date(ebayTokenState.expiresAt).toISOString() : null,
-  });
-});
-
-// 4. Publish Listing via Official eBay Inventory API & Offer API
-app.post('/api/ebay/publish', async (req, res) => {
-  try {
-    const { listing } = req.body;
-    if (!listing) {
-      return res.status(400).json({ ok: false, error: 'Listing payload is required.' });
-    }
-
-    // Check title length
-    if (listing.title && listing.title.length > 80) {
-      return res.status(400).json({
-        ok: false,
-        error: `Title exceeds the 80 character limit allowed by eBay (${listing.title.length}/80).`,
-      });
-    }
-
-    // If live access token exists, invoke official eBay Inventory & Offer APIs
-    if (ebayTokenState.accessToken && ebayTokenState.expiresAt && ebayTokenState.expiresAt > Date.now()) {
-      const apiHost = ebayTokenState.environment === 'SANDBOX'
-        ? 'https://api.sandbox.ebay.com'
-        : 'https://api.ebay.com';
-
-      const sku = listing.sku || `SINCHO-${listing.id.substring(0, 8)}`;
-
-      // Step A: Create or Replace Inventory Item
-      const inventoryPayload = {
-        availability: {
-          shipToLocationAvailability: {
-            quantity: listing.quantity || 1,
-          },
-        },
-        condition: listing.condition_id || 'NEW',
-        product: {
-          title: listing.title,
-          description: listing.description_html,
-          aspects: listing.item_specifics || {},
-          brand: listing.brand || 'Generic',
-          imageUrls: listing.images || [],
-          ean: listing.ean ? [listing.ean] : undefined,
-        },
-      };
-
-      const invRes = await fetch(`${apiHost}/sell/inventory/v1/inventory_item/${encodeURIComponent(sku)}`, {
-        method: 'PUT',
-        headers: {
-          'Authorization': `Bearer ${ebayTokenState.accessToken}`,
-          'Content-Type': 'application/json',
-          'Content-Language': 'it-IT',
-        },
-        body: JSON.stringify(inventoryPayload),
-      });
-
-      if (!invRes.ok && invRes.status !== 204 && invRes.status !== 201 && invRes.status !== 200) {
-        const invErr = await invRes.text();
-        return res.status(400).json({
-          ok: false,
-          error: `eBay Inventory Item error: ${invErr}`,
-        });
-      }
-
-      // Step B: Create Offer
-      const offerPayload = {
-        sku,
-        marketplaceId: listing.marketplace_id || 'EBAY_IT',
-        format: 'FIXED_PRICE',
-        pricingSummary: {
-          price: {
-            value: Number(listing.price).toFixed(2),
-            currency: 'EUR',
-          },
-        },
-        categoryId: listing.category_id || '180959',
-        listingPolicies: {
-          shippingPolicyId: listing.shipping_policy_id || undefined,
-          returnPolicyId: listing.return_policy_id || undefined,
-          paymentPolicyId: listing.payment_policy_id || undefined,
-        },
-      };
-
-      const offerRes = await fetch(`${apiHost}/sell/inventory/v1/offer`, {
-        method: 'POST',
-        headers: {
-          'Authorization': `Bearer ${ebayTokenState.accessToken}`,
-          'Content-Type': 'application/json',
-          'Content-Language': 'it-IT',
-        },
-        body: JSON.stringify(offerPayload),
-      });
-
-      const offerData = await offerRes.json();
-      if (!offerRes.ok) {
-        return res.status(400).json({
-          ok: false,
-          error: offerData.errors?.[0]?.message || 'eBay Offer creation error',
-        });
-      }
-
-      const offerId = offerData.offerId;
-
-      // Step C: Publish Offer
-      const pubRes = await fetch(`${apiHost}/sell/inventory/v1/offer/${offerId}/publish`, {
-        method: 'POST',
-        headers: {
-          'Authorization': `Bearer ${ebayTokenState.accessToken}`,
-          'Content-Type': 'application/json',
-        },
-      });
-
-      const pubData = await pubRes.json();
-      if (!pubRes.ok) {
-        return res.status(400).json({
-          ok: false,
-          error: pubData.errors?.[0]?.message || 'eBay Offer publication error',
-        });
-      }
-
-      return res.json({
-        ok: true,
-        status: 'active',
-        ebayItemId: pubData.listingId,
-        ebayOfferId: offerId,
-        message: 'Listing successfully published to eBay.it!',
-      });
-    }
-
-    // When token is not yet connected:
-    return res.json({
-      ok: false,
-      notConnected: true,
-      status: 'draft',
-      message: 'eBay account not yet authorized. The listing has been saved as a validated draft (title, price, item specifics, and HTML description verified). Connect your eBay Developer credentials in Settings to enable live publishing.',
-    });
-  } catch (err: any) {
-    res.status(500).json({ ok: false, error: err.message || 'Internal publication error' });
-  }
-});
+// Note: /api/ebay/status, /api/ebay/exchange-code, and /api/ebay/publish
+// are mounted and handled with verified workspace isolation via workspaceRouter above.
 
 async function startServer() {
   const isDev = process.env.NODE_ENV !== 'production';

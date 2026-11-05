@@ -924,8 +924,8 @@ BEGIN
 END;
 $$;
 
-REVOKE ALL ON FUNCTION public.claim_legacy_workspace(TEXT, UUID) FROM PUBLIC;
-GRANT EXECUTE ON FUNCTION public.claim_legacy_workspace(TEXT, UUID) TO authenticated, service_role;
+REVOKE ALL ON FUNCTION public.claim_legacy_workspace(TEXT, UUID) FROM PUBLIC, anon, authenticated;
+GRANT EXECUTE ON FUNCTION public.claim_legacy_workspace(TEXT, UUID) TO service_role;
 
 -- ------------------------------------------------------------------------------
 -- 8. eBay Credentials Protection & Secure Views
@@ -1402,20 +1402,20 @@ COMMIT;
 -- Expect: Returns a NEW isolated workspace UUID; User A is registered as 'owner' in workspace_members.
 -- User A has NO membership in and cannot see the seeded legacy workspace ('00000000-0000-0000-0000-000000000001').
 
--- TEST 2: Legacy Workspace Claim Protection
--- Action A: Unconfigured server secret test:
---   Calling SELECT public.claim_legacy_workspace('AnySecretPassphrase123!') without secret configured in Vault or secrets table:
+-- TEST 2: Legacy Workspace Claim Protection & Service Role Execution
+-- Action A: Direct authenticated caller permission test:
+--   Authenticated user calls SELECT public.claim_legacy_workspace('AnySecretPassphrase123!');
+--   Expect: ERROR 'permission denied for function claim_legacy_workspace' (EXECUTE revoked from PUBLIC, anon, authenticated).
+-- Action B: Backend service_role unconfigured server secret test:
+--   Service role calls SELECT public.claim_legacy_workspace('AnySecretPassphrase123!', 'target_user_id') without secret configured:
 --   Expect: ERROR 'Legacy workspace claiming is disabled: no valid claim secret is configured in Supabase Vault or public.legacy_workspace_claim_secrets.'
--- Action B: Configure secret via private table (or Supabase Vault) and execute claim:
+-- Action C: Backend service_role claim execution with valid secret:
 --   INSERT INTO public.legacy_workspace_claim_secrets (secret_name, secret_value) VALUES ('legacy_claim_secret', 'ServerSuperSecret2026!');
---   SELECT public.claim_legacy_workspace('ServerSuperSecret2026!');
---   Expect: SUCCESS. Default workspace ('00000000-0000-0000-0000-000000000001') assigned to caller as owner.
--- Action C: Subsequent claim attempt:
---   SELECT public.claim_legacy_workspace('ServerSuperSecret2026!');
+--   Service role calls SELECT public.claim_legacy_workspace('ServerSuperSecret2026!', 'target_user_id');
+--   Expect: SUCCESS. Default workspace ('00000000-0000-0000-0000-000000000001') assigned to target_user_id as owner.
+-- Action D: Subsequent claim attempt:
+--   Service role calls SELECT public.claim_legacy_workspace('ServerSuperSecret2026!', 'target_user_id');
 --   Expect: ERROR 'Access Denied: The legacy workspace has already been claimed and locked.'
--- Action D: Attempt session GUC override spoofing:
---   SET app.settings.legacy_claim_secret = 'attacker_pass';
---   (Has zero effect because claim_legacy_workspace strictly reads Vault or public.legacy_workspace_claim_secrets).
 
 -- TEST 3: Cross-Workspace Isolation
 -- Action: User A executes SELECT * FROM public.products;
