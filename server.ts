@@ -29,6 +29,7 @@ import {
   getWorkspaceConfig,
 } from './src/server/workspace.js';
 import { workspaceRouter } from './src/server/workspaceRoutes.js';
+import { runMonitoringScheduledCycle } from './src/server/monitoringService.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -576,6 +577,16 @@ async function startServer() {
 
   server.listen(PORT, '0.0.0.0', () => {
     console.log(`SinchoDS platform server running on http://0.0.0.0:${PORT}`);
+
+    // Start background price and stock monitoring cycle (runs every 60s independently of browser sessions)
+    const MONITORING_TICK_MS = 60 * 1000;
+    setInterval(async () => {
+      try {
+        await runMonitoringScheduledCycle();
+      } catch (err: any) {
+        console.error('Background monitoring cycle error:', err.message);
+      }
+    }, MONITORING_TICK_MS);
   });
 }
 

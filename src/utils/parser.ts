@@ -1,5 +1,5 @@
 import * as cheerio from 'cheerio';
-import { Product, ProductVariant } from '../types.js';
+import { Product, ProductVariant, Supplier } from '../types.js';
 
 export const ALLOWED_HOSTS = ['www.pluspowersupplements.com', 'pluspowersupplements.com'];
 
@@ -371,10 +371,15 @@ export function extractJsonLd(html: string): any | null {
 
   if (products.length === 0) return null;
 
-  // Rank product by richness (has offers, name, brand, image)
+  // Rank product by richness (hasVariant / ProductGroup takes precedence for multi-variant products)
   products.sort((a, b) => {
-    const scoreA = (a.name ? 2 : 0) + (a.offers ? 2 : 0) + (a.brand ? 1 : 0) + (a.image ? 1 : 0);
-    const scoreB = (b.name ? 2 : 0) + (b.offers ? 2 : 0) + (b.brand ? 1 : 0) + (b.image ? 1 : 0);
+    const hasVarA = Array.isArray(a.hasVariant) && a.hasVariant.length > 0;
+    const hasVarB = Array.isArray(b.hasVariant) && b.hasVariant.length > 0;
+    const isGroupA = typeof a['@type'] === 'string' && a['@type'].toLowerCase() === 'productgroup';
+    const isGroupB = typeof b['@type'] === 'string' && b['@type'].toLowerCase() === 'productgroup';
+
+    const scoreA = (hasVarA ? 6 : 0) + (isGroupA ? 3 : 0) + (a.name ? 2 : 0) + (a.offers ? 2 : 0) + (a.brand ? 1 : 0) + (a.image ? 1 : 0);
+    const scoreB = (hasVarB ? 6 : 0) + (isGroupB ? 3 : 0) + (b.name ? 2 : 0) + (b.offers ? 2 : 0) + (b.brand ? 1 : 0) + (b.image ? 1 : 0);
     return scoreB - scoreA;
   });
 
@@ -637,3 +642,452 @@ export function extractProductFromHtml(
     updated_at: now,
   };
 }
+
+/**
+ * Universal fallback product extractor.
+ * Supports standard JSON-LD Schema.org (Product, ProductGroup),
+ * OpenGraph, Twitter meta tags, Microdata, and standard HTML markup.
+ * Also applies custom CSS selectors if provided via supplier.parserConfig.
+ */
+export function extractUniversalProductFromHtml(
+  html: string,
+  sourceUrl: string,
+  supplier?: Partial<Supplier> | null,
+  importSource: 'live_scraper' | 'sitemap' | 'html_import' | 'manual' | 'zenrows_scraper' = 'html_import'
+): Product {
+  if (isCloudflareChallenge(html)) {
+    throw new Error(CLOUDFLARE_ERROR_MESSAGE);
+  }
+
+  const $ = cheerio.load(html);
+  const jsonLd = extractJsonLd(html);
+  const parserConfig = supplier?.parserConfig || supplier?.parser_config;
+
+  // 1. Title Extraction
+  let title = '';
+  if (parserConfig?.titleSelector) {
+    const customTitle = $(parserConfig.titleSelector).first().text().replace(/\s+/g, ' ').trim();
+    if (customTitle) title = customTitle;
+  }
+  if (!title && jsonLd?.name) {
+    title = String(jsonLd.name).trim();
+  }
+  if (!title) {
+    const h1 = $('h1').first().text().replace(/\s+/g, ' ').trim();
+    if (h1) title = h1;
+  }
+  if (!title) {
+    title =
+      $('meta[property="og:title"]').attr('content') ||
+      $('meta[name="twitter:title"]').attr('content') ||
+      $('title').first().text().trim() ||
+      '';
+  }
+
+  // 2. Brand Extraction
+  let brand: string | null = null;
+  if (jsonLd?.brand) {
+    if (typeof jsonLd.brand === 'object' && jsonLd.brand.name) {
+      brand = String(jsonLd.brand.name).trim();
+    } else if (typeof jsonLd.brand === 'string') {
+      brand = jsonLd.brand.trim();
+    }
+  }
+  if (!brand) {
+    brand =
+      $('[itemprop="brand"] meta[itemprop="name"]').attr('content') ||
+      $('[itemprop="brand"]').first().text().trim() ||
+      $('meta[name="brand"]').attr('content') ||
+      $('meta[property="product:brand"]').attr('content') ||
+      null;
+  }
+
+  // 3. Category
+  let category: string | null = null;
+  const breadcrumbs: string[] = [];
+  $('.breadcrumb li, .breadcrumbs li, nav[aria-label="breadcrumb"] li, ol.breadcrumb li').each((_, el) => {
+    const t = $(el).text().trim();
+    if (t && !t.toLowerCase().includes('home') && t !== '>') {
+      breadcrumbs.push(t);
+    }
+  });
+  if (breadcrumbs.length > 1) {
+    category = breadcrumbs.slice(0, -1).join(' > ');
+  } else if (jsonLd?.category) {
+    category = String(jsonLd.category).trim();
+  }
+
+  // 4. SKU & EAN
+  let sku: string | null = null;
+  let ean: string | null = null;
+
+  if (parserConfig?.skuSelector) {
+    const customSku = $(parserConfig.skuSelector).first().text().trim();
+    if (customSku) sku = customSku;
+  }
+  if (parserConfig?.eanSelector) {
+    const customEan = $(parserConfig.eanSelector).first().text().trim();
+    if (customEan) ean = customEan;
+  }
+
+  if (!sku) {
+    sku =
+      $('[itemprop="sku"]').attr('content') ||
+      $('[itemprop="sku"]').text().trim() ||
+      (jsonLd?.sku ? String(jsonLd.sku).trim() : null);
+  }
+
+  if (!ean) {
+    ean =
+      $('[itemprop="gtin13"]').attr('content') ||
+      $('[itemprop="gtin"]').attr('content') ||
+      $('[itemprop="ean"]').attr('content') ||
+      (jsonLd?.gtin13 || jsonLd?.gtin || jsonLd?.gtin8 || jsonLd?.ean
+        ? String(jsonLd.gtin13 || jsonLd.gtin || jsonLd.gtin8 || jsonLd.ean).trim()
+        : null);
+  }
+
+  // 5. Variants Extraction
+  const variants: ProductVariant[] = [];
+  if (Array.isArray(jsonLd?.hasVariant) && jsonLd.hasVariant.length > 0) {
+    for (const v of jsonLd.hasVariant) {
+      const vName = v.name || v.description || 'Variante';
+      const vSku = v.sku || null;
+      const vEan = v.gtin13 || v.gtin || v.ean || null;
+      const vOffers = Array.isArray(v.offers) ? v.offers[0] : v.offers;
+      const vPrice = parsePrice(vOffers?.price ?? v.price);
+      const vStock = vOffers?.availability ? (String(vOffers.availability).includes('InStock') ? 10 : 0) : null;
+
+      variants.push({
+        id: crypto.randomUUID ? crypto.randomUUID() : Math.random().toString(36).substring(2, 15),
+        variant_id: v.sku || v.name,
+        name: String(vName).trim(),
+        sku: vSku,
+        ean: vEan,
+        price: vPrice,
+        original_price: null,
+        stock_quantity: vStock,
+        availability: vStock === null ? null : vStock > 0 ? 'InStock' : 'OutOfStock',
+        expiry_date: null,
+      });
+    }
+  } else if (Array.isArray(jsonLd?.offers) && jsonLd.offers.length > 1) {
+    for (let idx = 0; idx < jsonLd.offers.length; idx++) {
+      const o = jsonLd.offers[idx];
+      const oPrice = parsePrice(o.price);
+      const oSku = o.sku || null;
+      const oName = o.name || o.description || `Opzione ${idx + 1}`;
+      const oStock = o.availability ? (String(o.availability).includes('InStock') ? 10 : 0) : null;
+
+      variants.push({
+        id: crypto.randomUUID ? crypto.randomUUID() : Math.random().toString(36).substring(2, 15),
+        variant_id: oSku || String(idx + 1),
+        name: String(oName).trim(),
+        sku: oSku,
+        ean: null,
+        price: oPrice,
+        original_price: null,
+        stock_quantity: oStock,
+        availability: oStock === null ? null : oStock > 0 ? 'InStock' : 'OutOfStock',
+        expiry_date: null,
+      });
+    }
+  } else {
+    // Check DOM select elements for variant attributes
+    const selectEl = $('select[name*="attribute"], select[name*="variant"], select[id*="attribute"], select[id*="variant"], .variant-select').first();
+    if (selectEl.length > 0) {
+      selectEl.find('option').each((_, opt) => {
+        const text = $(opt).text().trim();
+        const val = $(opt).attr('value');
+        if (text && val && !text.toLowerCase().includes('seleziona') && !text.toLowerCase().includes('scegli') && !text.toLowerCase().includes('select')) {
+          variants.push({
+            id: crypto.randomUUID ? crypto.randomUUID() : Math.random().toString(36).substring(2, 15),
+            variant_id: val,
+            name: text,
+            sku: null,
+            ean: null,
+            price: null,
+            original_price: null,
+            stock_quantity: null,
+            availability: 'InStock',
+            expiry_date: null,
+          });
+        }
+      });
+    }
+  }
+
+  // If no parent SKU/EAN, borrow from first variant if available
+  if (!sku && variants.length > 0 && variants[0].sku) sku = variants[0].sku;
+  if (!ean && variants.length > 0 && variants[0].ean) ean = variants[0].ean;
+
+  // 6. Pricing & Currency
+  let price: number | null = null;
+  let originalPrice: number | null = null;
+  let currency = 'EUR';
+
+  if (parserConfig?.priceSelector) {
+    const customPriceText = $(parserConfig.priceSelector).first().text();
+    price = parsePrice(customPriceText);
+  }
+
+  if (price === null && jsonLd?.offers) {
+    const offers = Array.isArray(jsonLd.offers) ? jsonLd.offers[0] : jsonLd.offers;
+    if (offers) {
+      if (offers.price) price = parsePrice(offers.price);
+      if (offers.priceCurrency) currency = String(offers.priceCurrency).trim();
+    }
+  }
+
+  if (price === null && variants.length > 0) {
+    const variantPrices = variants
+      .map((v) => (typeof v.price === 'number' ? v.price : parsePrice(v.price)))
+      .filter((p): p is number => p !== null);
+    if (variantPrices.length > 0) {
+      price = Math.min(...variantPrices);
+    }
+  }
+
+  if (price === null) {
+    const metaPrice = $('meta[property="product:price:amount"], meta[name="twitter:data1"], meta[property="og:price:amount"]').attr('content');
+    if (metaPrice) price = parsePrice(metaPrice);
+  }
+
+  if (price === null) {
+    const domPrice = $('.price, .product-price, [itemprop="price"], .current-price, .offer-price, .special-price, .prezzo').first().text();
+    price = parsePrice(domPrice);
+  }
+
+  const oldPriceText = $('.old-price, .regular-price, .prezzo-vecchio, del, s, .strikethrough').first().text();
+  originalPrice = parsePrice(oldPriceText);
+
+  let discountPercentage: number | null = null;
+  if (price !== null && originalPrice !== null && originalPrice > price) {
+    discountPercentage = Math.round(((originalPrice - price) / originalPrice) * 100);
+  }
+
+  // 7. Stock & Availability
+  let stockQuantity: number | null = null;
+  let availability: 'InStock' | 'OutOfStock' | string | null = null;
+
+  if (variants.length > 0) {
+    const totalStock = variants.reduce((sum, v) => sum + (v.stock_quantity || 0), 0);
+    if (totalStock > 0) {
+      stockQuantity = totalStock;
+      availability = 'InStock';
+    }
+  }
+  if (!availability && jsonLd?.offers) {
+    const offers = Array.isArray(jsonLd.offers) ? jsonLd.offers[0] : jsonLd.offers;
+    if (offers?.availability) {
+      availability = String(offers.availability).includes('InStock') ? 'InStock' : 'OutOfStock';
+    }
+  }
+  if (!availability) {
+    const stockText = $('.stock, .availability, [itemprop="availability"], .in-stock, .out-of-stock').text().toLowerCase();
+    if (stockText.includes('non disponibile') || stockText.includes('esaurito') || stockText.includes('out of stock')) {
+      availability = 'OutOfStock';
+      stockQuantity = 0;
+    } else if (stockText.includes('disponibile') || stockText.includes('in stock')) {
+      availability = 'InStock';
+      if (stockQuantity === null) stockQuantity = 10;
+    }
+  }
+
+  // 8. Images
+  const images: string[] = [];
+  const addImage = (src?: string) => {
+    if (!src) return;
+    let clean = src.trim();
+    if (!clean || clean.startsWith('data:')) return;
+    try {
+      clean = new URL(clean, sourceUrl).href;
+      if (!images.includes(clean)) {
+        images.push(clean);
+      }
+    } catch {
+      // Ignore invalid URL
+    }
+  };
+
+  if (parserConfig?.imageSelector) {
+    $(parserConfig.imageSelector).each((_, el) => {
+      addImage($(el).attr('src') || $(el).attr('data-src') || $(el).attr('href'));
+    });
+  }
+
+  if (jsonLd?.image) {
+    if (Array.isArray(jsonLd.image)) {
+      jsonLd.image.forEach((img: any) => addImage(typeof img === 'string' ? img : img?.url));
+    } else if (typeof jsonLd.image === 'string') {
+      addImage(jsonLd.image);
+    } else if (typeof jsonLd.image === 'object' && jsonLd.image.url) {
+      addImage(jsonLd.image.url);
+    }
+  }
+
+  addImage($('meta[property="og:image"]').attr('content'));
+  addImage($('meta[name="twitter:image"]').attr('content'));
+  $('link[itemprop="image"]').each((_, el) => addImage($(el).attr('href')));
+  $('.product-gallery img, .product-images img, #gallery img, .main-image img').each((_, el) => {
+    addImage($(el).attr('src') || $(el).attr('data-src') || $(el).attr('data-zoom-image'));
+  });
+
+  // 9. Description
+  let description: string | null = null;
+  if (parserConfig?.descriptionSelector) {
+    const customDesc = $(parserConfig.descriptionSelector).first().text().replace(/\s+/g, ' ').trim();
+    if (customDesc) description = customDesc;
+  }
+  if (!description && jsonLd?.description) {
+    description = String(jsonLd.description).trim();
+  }
+  if (!description) {
+    const descEl = $('#description, .description, [itemprop="description"], #tab-description, .product-description, .product-details').first();
+    if (descEl.length) {
+      description = descEl.text().replace(/\s+/g, ' ').trim();
+    }
+  }
+  if (!description) {
+    description = $('meta[property="og:description"]').attr('content') || $('meta[name="description"]').attr('content') || null;
+  }
+
+  // Derive supplier name from URL or supplier object
+  let resolvedSupplierId = supplier?.id || 'custom';
+  let resolvedSupplierName = supplier?.name;
+  if (!resolvedSupplierName) {
+    try {
+      const u = new URL(sourceUrl);
+      resolvedSupplierName = u.hostname.replace(/^www\./, '');
+    } catch {
+      resolvedSupplierName = 'Fornitore Esterno';
+    }
+  }
+
+  const missingCoreFields: string[] = [];
+  if (!title) missingCoreFields.push('title');
+  if (price === null) missingCoreFields.push('price');
+  if (!sku) missingCoreFields.push('sku');
+  if (!ean) missingCoreFields.push('ean');
+
+  const errorMsg = missingCoreFields.length > 0 ? `Fields requiring review: ${missingCoreFields.join(', ')}` : undefined;
+  const now = new Date().toISOString();
+
+  return {
+    id: crypto.randomUUID ? crypto.randomUUID() : Math.random().toString(36).substring(2, 15),
+    supplier_id: resolvedSupplierId,
+    supplier_name: resolvedSupplierName,
+    url: normalizeProductUrl(sourceUrl),
+    title,
+    brand: brand || null,
+    category: category || null,
+    price,
+    original_price: originalPrice,
+    discount_percentage: discountPercentage,
+    currency,
+    sku: sku || null,
+    ean: ean || null,
+    availability: availability || 'InStock',
+    stock_quantity: stockQuantity,
+    description: description || null,
+    ingredients: null,
+    nutrition: null,
+    images,
+    variants,
+    raw_jsonld: jsonLd,
+    import_source: importSource,
+    status: 'draft', // Required: Save imported products as Drafts
+    ebay_status: 'not_listed',
+    error: errorMsg || null,
+    created_at: now,
+    updated_at: now,
+  };
+}
+
+/**
+ * Automatically detects the supplier matching a given URL.
+ */
+export function detectSupplierFromUrl(url: string, suppliers?: Supplier[]): Supplier | null {
+  if (!url) return null;
+  try {
+    const parsed = new URL(url.trim());
+    const host = parsed.hostname.toLowerCase().replace(/^www\./, '');
+
+    // Check PlusPower hosts
+    if (ALLOWED_HOSTS.some((h) => h.replace(/^www\./, '').toLowerCase() === host)) {
+      return {
+        id: 'pluspower',
+        name: 'PlusPower Supplements',
+        baseUrl: 'https://www.pluspowersupplements.com',
+        logoText: '⚡ PlusPower',
+        status: 'active',
+        lastSyncAt: new Date().toISOString(),
+        productCount: 1,
+        failedCount: 0,
+        description: 'Fornitore primario integratori alimentari.',
+        isGlobal: true,
+        supportedFeatures: {
+          sitemap: true,
+          variants: true,
+          lotExpiry: true,
+          liveScraping: true,
+          htmlImport: true,
+        },
+      };
+    }
+
+    if (Array.isArray(suppliers)) {
+      for (const s of suppliers) {
+        if (!s.baseUrl) continue;
+        try {
+          const sHost = new URL(s.baseUrl).hostname.toLowerCase().replace(/^www\./, '');
+          if (host === sHost || host.endsWith('.' + sHost)) {
+            return s;
+          }
+        } catch {
+          // ignore invalid baseUrl
+        }
+      }
+    }
+  } catch {
+    // invalid url
+  }
+  return null;
+}
+
+/**
+ * Universal extraction pipeline:
+ * 1. Checks if URL matches PlusPower or if PlusPower connector is selected.
+ * 2. Uses specialized PlusPower parser if matching.
+ * 3. Otherwise uses universal Schema.org/OpenGraph fallback parser with custom selector support.
+ * 4. Preserves status as 'draft' and ebay_status as 'not_listed'.
+ */
+export function parseProductWithSupplierFallback(
+  html: string,
+  url: string,
+  supplier?: Supplier | null,
+  allSuppliers?: Supplier[],
+  importSource: 'live_scraper' | 'sitemap' | 'html_import' | 'manual' | 'zenrows_scraper' = 'html_import'
+): Product {
+  const matchedSupplier = supplier || detectSupplierFromUrl(url, allSuppliers);
+  const isPlusPower =
+    matchedSupplier?.id === 'pluspower' ||
+    ALLOWED_HOSTS.some((h) => {
+      try {
+        return new URL(url).hostname.toLowerCase() === h.toLowerCase();
+      } catch {
+        return false;
+      }
+    });
+
+  if (isPlusPower) {
+    const product = extractProductFromHtml(html, url, importSource);
+    // User requirement: "Save imported products as Drafts"
+    product.status = 'draft';
+    product.ebay_status = 'not_listed';
+    return product;
+  }
+
+  return extractUniversalProductFromHtml(html, url, matchedSupplier, importSource);
+}
+

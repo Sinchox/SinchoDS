@@ -68,7 +68,17 @@ export const Settings: React.FC<SettingsProps> = ({
   const [zenrowsTesting, setZenrowsTesting] = useState(false);
   const [zenrowsTestResult, setZenrowsTestResult] = useState<{ ok: boolean; message: string; sampleTitle?: string } | null>(null);
 
-  // Check eBay status and ZenRows status on mount
+  // Monitoring Settings (Phase 1.4)
+  const [monitoringConfig, setMonitoringConfig] = useState({
+    globalIntervalMinutes: 360,
+    defaultEbayQuantity: 3,
+    minimumProfitEur: 3.0,
+    packagingCost: 0.0,
+    concurrencyLimit: 2,
+    maxRetries: 3,
+  });
+
+  // Check eBay status, ZenRows status, and Monitoring settings on mount
   useEffect(() => {
     fetch('/api/ebay/status')
       .then((res) => res.json())
@@ -81,6 +91,15 @@ export const Settings: React.FC<SettingsProps> = ({
       .then((res) => res.json())
       .then((data) => {
         setZenrowsConfigured(Boolean(data?.configured));
+      })
+      .catch(() => {});
+
+    fetch('/api/monitoring/settings')
+      .then((res) => res.json())
+      .then((data) => {
+        if (data.ok && data.settings) {
+          setMonitoringConfig((prev) => ({ ...prev, ...data.settings }));
+        }
       })
       .catch(() => {});
   }, [setIsEbayConnected]);
@@ -108,6 +127,12 @@ export const Settings: React.FC<SettingsProps> = ({
 
   const handleSaveSettings = () => {
     saveStoredSettings(settings);
+    fetch('/api/monitoring/settings', {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(monitoringConfig),
+    }).catch(() => {});
+
     setSavedAlert(true);
     setTimeout(() => setSavedAlert(false), 2500);
     handleTestConnection();
@@ -533,6 +558,108 @@ export const Settings: React.FC<SettingsProps> = ({
           className="px-3.5 py-1.5 bg-slate-800 hover:bg-slate-700 text-slate-200 rounded-xl text-xs font-semibold border border-slate-700"
         >
           Save Pricing Rules
+        </button>
+      </div>
+
+      {/* Automatic Price & Stock Monitoring Configuration (Phase 1.4) */}
+      <div className="bg-slate-900/80 border border-slate-800 rounded-2xl p-4 sm:p-5 space-y-4">
+        <div className="flex items-center justify-between border-b border-slate-800 pb-3">
+          <div>
+            <h2 className="text-sm font-bold text-white flex items-center">
+              <Clock className="w-4 h-4 mr-2 text-blue-400" />
+              Automatic Price &amp; Stock Monitoring Engine
+            </h2>
+            <p className="text-xs text-slate-400 mt-0.5">
+              Configures persistent background scrape jobs that verify supplier prices and stock every 6 hours independently of browser sessions.
+            </p>
+          </div>
+          <span className="text-[10px] bg-blue-500/10 text-blue-400 border border-blue-500/20 px-2 py-0.5 rounded-full font-semibold">
+            6h Scheduled Cycle Active
+          </span>
+        </div>
+
+        <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-4 gap-3 text-xs">
+          <div>
+            <label className="block text-slate-400 mb-1 font-medium">Monitoring Interval</label>
+            <select
+              value={monitoringConfig.globalIntervalMinutes}
+              onChange={(e) =>
+                setMonitoringConfig({
+                  ...monitoringConfig,
+                  globalIntervalMinutes: parseInt(e.target.value) || 360,
+                })
+              }
+              className="w-full bg-slate-950 border border-slate-800 rounded-lg p-2 text-white outline-none"
+            >
+              <option value="120">Every 2 Hours (120m)</option>
+              <option value="240">Every 4 Hours (240m)</option>
+              <option value="360">Every 6 Hours (360m - Default)</option>
+              <option value="720">Every 12 Hours (720m)</option>
+              <option value="1440">Every 24 Hours (Daily)</option>
+            </select>
+          </div>
+
+          <div>
+            <label className="block text-slate-400 mb-1 font-medium">Default eBay Quantity</label>
+            <select
+              value={monitoringConfig.defaultEbayQuantity}
+              onChange={(e) =>
+                setMonitoringConfig({
+                  ...monitoringConfig,
+                  defaultEbayQuantity: parseInt(e.target.value) === 5 ? 5 : 3,
+                })
+              }
+              className="w-full bg-slate-950 border border-slate-800 rounded-lg p-2 text-white outline-none"
+            >
+              <option value="3">3 Units (Conservative dropship default)</option>
+              <option value="5">5 Units (Higher volume buffer)</option>
+            </select>
+          </div>
+
+          <div>
+            <label className="block text-slate-400 mb-1 font-medium">Min. Dropship Profit (€)</label>
+            <input
+              type="number"
+              step="0.5"
+              value={monitoringConfig.minimumProfitEur}
+              onChange={(e) =>
+                setMonitoringConfig({
+                  ...monitoringConfig,
+                  minimumProfitEur: parseFloat(e.target.value) || 3.0,
+                })
+              }
+              className="w-full bg-slate-950 border border-slate-800 rounded-lg p-2 text-white"
+            />
+          </div>
+
+          <div>
+            <label className="block text-slate-400 mb-1 font-medium">Packaging Cost (€)</label>
+            <input
+              type="number"
+              step="0.25"
+              value={monitoringConfig.packagingCost}
+              onChange={(e) =>
+                setMonitoringConfig({
+                  ...monitoringConfig,
+                  packagingCost: parseFloat(e.target.value) || 0.0,
+                })
+              }
+              className="w-full bg-slate-950 border border-slate-800 rounded-lg p-2 text-white"
+            />
+          </div>
+        </div>
+
+        <div className="p-3 bg-slate-950 border border-slate-800 rounded-xl text-slate-400 text-[11px] leading-relaxed">
+          <span className="font-semibold text-slate-300 block mb-0.5">Automated Rules &amp; Recovery:</span>
+          When supplier stock reaches 0, the eBay listing available quantity is set to 0 without ending the listing. When supplier stock returns, available quantity is restored to the configured fixed quantity ({monitoringConfig.defaultEbayQuantity} units). Supplier price increases only recalculate listings if the €{monitoringConfig.minimumProfitEur.toFixed(2)} profit threshold is preserved.
+        </div>
+
+        <button
+          onClick={handleSaveSettings}
+          className="px-3.5 py-1.5 bg-blue-600 hover:bg-blue-500 text-white rounded-xl text-xs font-semibold shadow-sm inline-flex items-center space-x-1.5"
+        >
+          <Clock className="w-3.5 h-3.5" />
+          <span>Save Monitoring Settings</span>
         </button>
       </div>
 

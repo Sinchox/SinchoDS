@@ -11,9 +11,22 @@ import {
   saveWorkspaceProduct,
   deleteWorkspaceProduct,
   bulkDeleteWorkspaceProducts,
+  archiveWorkspaceProduct,
+  restoreWorkspaceProduct,
+  bulkArchiveWorkspaceProducts,
+  bulkRestoreWorkspaceProducts,
+  addWorkspaceProductVariant,
+  updateWorkspaceProductVariant,
+  deleteWorkspaceProductVariant,
   listWorkspaceSuppliers,
   saveWorkspaceSupplier,
   deleteWorkspaceSupplier,
+  toggleWorkspaceSupplierConnection,
+  testSupplierParser,
+  importSingleProductUrl,
+  createWorkspaceImportJob,
+  getWorkspaceImportJob,
+  getWorkspaceImportJobs,
   getWorkspaceEbayStatus,
   saveWorkspaceEbayTokens,
   getWorkspaceEbayTokensForPublishing,
@@ -24,10 +37,27 @@ import {
   saveWorkspaceOrder,
   listWorkspacePriceHistory,
   recordWorkspacePriceChange,
+  approveWorkspacePriceChange,
+  rejectWorkspacePriceChange,
   listWorkspaceImportHistory,
   addWorkspaceImportHistory,
   clearWorkspaceImportHistory,
 } from './workspaceStore.js';
+import {
+  checkProductNow,
+  checkProductsBulk,
+  getWorkspaceMonitoringSettings,
+  saveWorkspaceMonitoringSettings,
+  listWorkspaceNotifications,
+  markWorkspaceNotificationRead,
+  resolveWorkspaceNotification,
+  markAllWorkspaceNotificationsRead,
+  listWorkspaceChangeReviews,
+  approveWorkspaceChangeReview,
+  rejectWorkspaceChangeReview,
+  listWorkspaceMonitoringJobs,
+  listWorkspaceEbaySyncEvents,
+} from './monitoringService.js';
 import { verifyAuthUser, getWorkspaceConfig, createServiceRoleClient } from './workspace.js';
 
 export const workspaceRouter = express.Router();
@@ -285,6 +315,263 @@ workspaceRouter.post(
   }
 );
 
+/**
+ * PUT /api/products/:id/archive
+ */
+workspaceRouter.put(
+  '/products/:id/archive',
+  requireWorkspaceContext({ minRole: 'manager' }),
+  async (req: AuthenticatedWorkspaceRequest, res: Response) => {
+    try {
+      const product = await archiveWorkspaceProduct(req.workspace!.id, req.params.id);
+      if (!product) {
+        res.status(404).json({ ok: false, error: 'Product not found in this workspace' });
+        return;
+      }
+      res.json({ ok: true, product, message: 'Product archived' });
+    } catch (err: any) {
+      res.status(500).json({ ok: false, error: err.message || 'Error archiving product' });
+    }
+  }
+);
+
+/**
+ * PUT /api/products/:id/restore
+ */
+workspaceRouter.put(
+  '/products/:id/restore',
+  requireWorkspaceContext({ minRole: 'manager' }),
+  async (req: AuthenticatedWorkspaceRequest, res: Response) => {
+    try {
+      const product = await restoreWorkspaceProduct(req.workspace!.id, req.params.id);
+      if (!product) {
+        res.status(404).json({ ok: false, error: 'Product not found in this workspace' });
+        return;
+      }
+      res.json({ ok: true, product, message: 'Product restored' });
+    } catch (err: any) {
+      res.status(500).json({ ok: false, error: err.message || 'Error restoring product' });
+    }
+  }
+);
+
+/**
+ * POST /api/products/bulk-archive
+ */
+workspaceRouter.post(
+  '/products/bulk-archive',
+  requireWorkspaceContext({ minRole: 'manager' }),
+  async (req: AuthenticatedWorkspaceRequest, res: Response) => {
+    try {
+      const ids = req.body?.ids;
+      if (!Array.isArray(ids) || ids.length === 0) {
+        res.status(400).json({ ok: false, error: 'ids array is required.' });
+        return;
+      }
+      const count = await bulkArchiveWorkspaceProducts(req.workspace!.id, ids);
+      res.json({ ok: true, count });
+    } catch (err: any) {
+      res.status(500).json({ ok: false, error: err.message || 'Error archiving products' });
+    }
+  }
+);
+
+/**
+ * POST /api/products/bulk-restore
+ */
+workspaceRouter.post(
+  '/products/bulk-restore',
+  requireWorkspaceContext({ minRole: 'manager' }),
+  async (req: AuthenticatedWorkspaceRequest, res: Response) => {
+    try {
+      const ids = req.body?.ids;
+      if (!Array.isArray(ids) || ids.length === 0) {
+        res.status(400).json({ ok: false, error: 'ids array is required.' });
+        return;
+      }
+      const count = await bulkRestoreWorkspaceProducts(req.workspace!.id, ids);
+      res.json({ ok: true, count });
+    } catch (err: any) {
+      res.status(500).json({ ok: false, error: err.message || 'Error restoring products' });
+    }
+  }
+);
+
+/**
+ * POST /api/products/:id/variants
+ * Adds a new variant to product
+ */
+workspaceRouter.post(
+  '/products/:id/variants',
+  requireWorkspaceContext({ minRole: 'manager' }),
+  async (req: AuthenticatedWorkspaceRequest, res: Response) => {
+    try {
+      const variant = req.body?.variant || req.body;
+      const result = await addWorkspaceProductVariant(req.workspace!.id, req.params.id, variant);
+      if (!result.ok) {
+        res.status(400).json({ ok: false, error: result.error });
+        return;
+      }
+      res.json({ ok: true, product: result.product });
+    } catch (err: any) {
+      res.status(500).json({ ok: false, error: err.message || 'Error adding variant' });
+    }
+  }
+);
+
+/**
+ * PUT /api/products/:id/variants/:variantId
+ * Updates an existing variant without flattening
+ */
+workspaceRouter.put(
+  '/products/:id/variants/:variantId',
+  requireWorkspaceContext({ minRole: 'manager' }),
+  async (req: AuthenticatedWorkspaceRequest, res: Response) => {
+    try {
+      const updates = req.body?.variant || req.body;
+      const result = await updateWorkspaceProductVariant(req.workspace!.id, req.params.id, req.params.variantId, updates);
+      if (!result.ok) {
+        res.status(400).json({ ok: false, error: result.error });
+        return;
+      }
+      res.json({ ok: true, product: result.product });
+    } catch (err: any) {
+      res.status(500).json({ ok: false, error: err.message || 'Error updating variant' });
+    }
+  }
+);
+
+/**
+ * DELETE /api/products/:id/variants/:variantId
+ */
+workspaceRouter.delete(
+  '/products/:id/variants/:variantId',
+  requireWorkspaceContext({ minRole: 'manager' }),
+  async (req: AuthenticatedWorkspaceRequest, res: Response) => {
+    try {
+      const result = await deleteWorkspaceProductVariant(req.workspace!.id, req.params.id, req.params.variantId);
+      if (!result.ok) {
+        res.status(400).json({ ok: false, error: result.error });
+        return;
+      }
+      res.json({ ok: true, product: result.product });
+    } catch (err: any) {
+      res.status(500).json({ ok: false, error: err.message || 'Error deleting variant' });
+    }
+  }
+);
+
+/**
+ * POST /api/products/import-url
+ * Single URL import with workspace duplicate prevention and Draft status
+ */
+workspaceRouter.post(
+  '/products/import-url',
+  requireWorkspaceContext({ minRole: 'manager' }),
+  async (req: AuthenticatedWorkspaceRequest, res: Response) => {
+    try {
+      const { url, supplierId, fetchMethod, jsRender } = req.body;
+      if (!url) {
+        res.status(400).json({ ok: false, error: 'Product URL is required.' });
+        return;
+      }
+
+      const result = await importSingleProductUrl(
+        req.workspace!.id,
+        url,
+        supplierId,
+        fetchMethod || 'direct',
+        Boolean(jsRender)
+      );
+
+      if (result.isDuplicate) {
+        res.status(409).json({
+          ok: false,
+          isDuplicate: true,
+          error: result.error,
+          product: result.product,
+        });
+        return;
+      }
+
+      if (!result.ok) {
+        res.status(400).json({ ok: false, error: result.error });
+        return;
+      }
+
+      res.json({ ok: true, product: result.product });
+    } catch (err: any) {
+      res.status(500).json({ ok: false, error: err.message || 'Error importing product URL' });
+    }
+  }
+);
+
+/**
+ * POST /api/imports/jobs
+ * Starts an asynchronous background import job that continues even if browser disconnects
+ */
+workspaceRouter.post(
+  '/imports/jobs',
+  requireWorkspaceContext({ minRole: 'manager' }),
+  async (req: AuthenticatedWorkspaceRequest, res: Response) => {
+    try {
+      const { urls, supplierId, fetchMethod, jsRender } = req.body;
+      if (!Array.isArray(urls) || urls.length === 0) {
+        res.status(400).json({ ok: false, error: 'urls array is required.' });
+        return;
+      }
+
+      const job = createWorkspaceImportJob(
+        req.workspace!.id,
+        urls,
+        supplierId,
+        fetchMethod || 'direct',
+        Boolean(jsRender)
+      );
+
+      res.json({ ok: true, jobId: job.id, job });
+    } catch (err: any) {
+      res.status(500).json({ ok: false, error: err.message || 'Error starting import job' });
+    }
+  }
+);
+
+/**
+ * GET /api/imports/jobs/:jobId
+ */
+workspaceRouter.get(
+  '/imports/jobs/:jobId',
+  requireWorkspaceContext({ minRole: 'viewer' }),
+  async (req: AuthenticatedWorkspaceRequest, res: Response) => {
+    try {
+      const job = getWorkspaceImportJob(req.workspace!.id, req.params.jobId);
+      if (!job) {
+        res.status(404).json({ ok: false, error: 'Import job not found' });
+        return;
+      }
+      res.json({ ok: true, job });
+    } catch (err: any) {
+      res.status(500).json({ ok: false, error: err.message || 'Error fetching import job' });
+    }
+  }
+);
+
+/**
+ * GET /api/imports/jobs
+ */
+workspaceRouter.get(
+  '/imports/jobs',
+  requireWorkspaceContext({ minRole: 'viewer' }),
+  async (req: AuthenticatedWorkspaceRequest, res: Response) => {
+    try {
+      const jobs = getWorkspaceImportJobs(req.workspace!.id);
+      res.json({ ok: true, jobs });
+    } catch (err: any) {
+      res.status(500).json({ ok: false, error: err.message || 'Error listing import jobs' });
+    }
+  }
+);
+
 // ==============================================================================
 // 3. SUPPLIERS (Global + Workspace-Specific)
 // ==============================================================================
@@ -329,6 +616,114 @@ workspaceRouter.post(
       res.json({ ok: true, supplier: result.supplier });
     } catch (err: any) {
       res.status(500).json({ ok: false, error: err.message || 'Error saving supplier' });
+    }
+  }
+);
+
+/**
+ * PUT /api/suppliers/:id
+ * Updates a custom workspace supplier
+ */
+workspaceRouter.put(
+  '/suppliers/:id',
+  requireWorkspaceContext({ minRole: 'manager' }),
+  async (req: AuthenticatedWorkspaceRequest, res: Response) => {
+    try {
+      const supplier = req.body?.supplier || req.body;
+      supplier.id = req.params.id;
+
+      const result = await saveWorkspaceSupplier(req.workspace!.id, supplier, req.workspace!.role);
+      if (!result.ok) {
+        res.status(403).json({ ok: false, error: result.error });
+        return;
+      }
+      res.json({ ok: true, supplier: result.supplier });
+    } catch (err: any) {
+      res.status(500).json({ ok: false, error: err.message || 'Error updating supplier' });
+    }
+  }
+);
+
+/**
+ * POST /api/suppliers/:id/connect
+ */
+workspaceRouter.post(
+  '/suppliers/:id/connect',
+  requireWorkspaceContext({ minRole: 'manager' }),
+  async (req: AuthenticatedWorkspaceRequest, res: Response) => {
+    try {
+      const result = await toggleWorkspaceSupplierConnection(req.workspace!.id, req.params.id, true, req.workspace!.role);
+      if (!result.ok) {
+        res.status(400).json({ ok: false, error: result.error });
+        return;
+      }
+      res.json({ ok: true, supplier: result.supplier, message: 'Supplier connected' });
+    } catch (err: any) {
+      res.status(500).json({ ok: false, error: err.message || 'Error connecting supplier' });
+    }
+  }
+);
+
+/**
+ * POST /api/suppliers/:id/disconnect
+ */
+workspaceRouter.post(
+  '/suppliers/:id/disconnect',
+  requireWorkspaceContext({ minRole: 'manager' }),
+  async (req: AuthenticatedWorkspaceRequest, res: Response) => {
+    try {
+      const result = await toggleWorkspaceSupplierConnection(req.workspace!.id, req.params.id, false, req.workspace!.role);
+      if (!result.ok) {
+        res.status(400).json({ ok: false, error: result.error });
+        return;
+      }
+      res.json({ ok: true, supplier: result.supplier, message: 'Supplier disconnected' });
+    } catch (err: any) {
+      res.status(500).json({ ok: false, error: err.message || 'Error disconnecting supplier' });
+    }
+  }
+);
+
+/**
+ * POST /api/suppliers/test-parser
+ * Runs parser test mode on supplied product URL and returns detected fields / errors
+ */
+workspaceRouter.post(
+  '/suppliers/test-parser',
+  requireWorkspaceContext({ minRole: 'viewer' }),
+  async (req: AuthenticatedWorkspaceRequest, res: Response) => {
+    try {
+      const { url, supplierId, parserConfig, fetchMethod, jsRender } = req.body;
+      if (!url) {
+        res.status(400).json({ ok: false, error: 'Product URL is required for parser test mode.' });
+        return;
+      }
+
+      const result = await testSupplierParser(
+        req.workspace!.id,
+        url,
+        supplierId,
+        parserConfig,
+        fetchMethod || 'direct',
+        Boolean(jsRender)
+      );
+
+      if (!result.ok) {
+        res.status(400).json({
+          ok: false,
+          error: result.error,
+          detectedFields: result.detectedFields,
+        });
+        return;
+      }
+
+      res.json({
+        ok: true,
+        product: result.product,
+        detectedFields: result.detectedFields,
+      });
+    } catch (err: any) {
+      res.status(500).json({ ok: false, error: err.message || 'Error testing parser' });
     }
   }
 );
@@ -801,3 +1196,354 @@ workspaceRouter.post(
     }
   }
 );
+
+// ==============================================================================
+// 7. AUTOMATIC PRICE & STOCK MONITORING (Phase 1.4)
+// ==============================================================================
+
+/**
+ * POST /api/monitoring/check-now
+ * Trigger immediate monitoring check for one or multiple products in workspace.
+ */
+workspaceRouter.post(
+  '/monitoring/check-now',
+  requireWorkspaceContext({ minRole: 'editor' }),
+  async (req: AuthenticatedWorkspaceRequest, res: Response) => {
+    try {
+      const workspaceId = req.workspace!.id;
+      const { productIds, productId } = req.body || {};
+
+      const targetIds: string[] = Array.isArray(productIds)
+        ? productIds.map(String).filter(Boolean)
+        : productId
+        ? [String(productId)]
+        : [];
+
+      if (targetIds.length === 0) {
+        // If no productIds supplied, check all products in the workspace
+        const prods = await listWorkspaceProducts(workspaceId);
+        targetIds.push(...prods.map((p) => p.id));
+      }
+
+      if (targetIds.length === 0) {
+        res.json({ ok: true, results: [], message: 'No products to monitor in this workspace.' });
+        return;
+      }
+
+      const results = await checkProductsBulk(workspaceId, targetIds);
+      res.json({ ok: true, results, count: results.length });
+    } catch (err: any) {
+      res.status(500).json({ ok: false, error: err.message || 'Monitoring execution failed' });
+    }
+  }
+);
+
+/**
+ * GET /api/monitoring/status
+ * Returns workspace monitoring status, count of due products, and queues.
+ */
+workspaceRouter.get(
+  '/monitoring/status',
+  requireWorkspaceContext({ minRole: 'viewer' }),
+  async (req: AuthenticatedWorkspaceRequest, res: Response) => {
+    try {
+      const workspaceId = req.workspace!.id;
+      const products = await listWorkspaceProducts(workspaceId);
+      const reviews = await listWorkspaceChangeReviews(workspaceId, { status: 'pending' });
+      const priceHistory = await listWorkspacePriceHistory(workspaceId);
+      const pendingPriceApprovals = priceHistory.filter((h) => h.status === 'pending_approval');
+      const notifications = await listWorkspaceNotifications(workspaceId, { unreadOnly: true });
+      const settings = getWorkspaceMonitoringSettings(workspaceId);
+
+      const statusCounts = {
+        total: products.length,
+        idle: 0,
+        checking: 0,
+        error: 0,
+        out_of_stock: 0,
+        pending_approval: 0,
+        changes_detected: 0,
+      };
+
+      let nextDueTimestamp: string | null = null;
+      const now = Date.now();
+
+      for (const p of products) {
+        const s = (p.monitoring_status || 'idle') as keyof typeof statusCounts;
+        if (statusCounts[s] !== undefined) {
+          statusCounts[s]++;
+        } else {
+          statusCounts.idle++;
+        }
+
+        if (p.next_check_at) {
+          if (!nextDueTimestamp || new Date(p.next_check_at).getTime() < new Date(nextDueTimestamp).getTime()) {
+            nextDueTimestamp = p.next_check_at;
+          }
+        }
+      }
+
+      res.json({
+        ok: true,
+        workspaceId,
+        statusCounts,
+        pendingReviewsCount: reviews.length,
+        pendingPriceApprovalsCount: pendingPriceApprovals.length,
+        unreadNotificationsCount: notifications.length,
+        nextDueTimestamp,
+        settings,
+      });
+    } catch (err: any) {
+      res.status(500).json({ ok: false, error: err.message || 'Error fetching monitoring status' });
+    }
+  }
+);
+
+/**
+ * GET /api/monitoring/settings
+ */
+workspaceRouter.get(
+  '/monitoring/settings',
+  requireWorkspaceContext({ minRole: 'viewer' }),
+  async (req: AuthenticatedWorkspaceRequest, res: Response) => {
+    try {
+      const settings = getWorkspaceMonitoringSettings(req.workspace!.id);
+      res.json({ ok: true, settings });
+    } catch (err: any) {
+      res.status(500).json({ ok: false, error: err.message || 'Error fetching monitoring settings' });
+    }
+  }
+);
+
+/**
+ * PUT /api/monitoring/settings
+ */
+workspaceRouter.put(
+  '/monitoring/settings',
+  requireWorkspaceContext({ minRole: 'manager' }),
+  async (req: AuthenticatedWorkspaceRequest, res: Response) => {
+    try {
+      const updated = saveWorkspaceMonitoringSettings(req.workspace!.id, req.body || {});
+      res.json({ ok: true, settings: updated });
+    } catch (err: any) {
+      res.status(500).json({ ok: false, error: err.message || 'Error saving monitoring settings' });
+    }
+  }
+);
+
+/**
+ * GET /api/monitoring/reviews
+ * List pending or filtered product content change reviews.
+ */
+workspaceRouter.get(
+  '/monitoring/reviews',
+  requireWorkspaceContext({ minRole: 'viewer' }),
+  async (req: AuthenticatedWorkspaceRequest, res: Response) => {
+    try {
+      const status = req.query.status as any;
+      const productId = req.query.productId as string;
+      const reviews = await listWorkspaceChangeReviews(req.workspace!.id, { status, productId });
+      res.json({ ok: true, reviews });
+    } catch (err: any) {
+      res.status(500).json({ ok: false, error: err.message || 'Error listing change reviews' });
+    }
+  }
+);
+
+/**
+ * POST /api/monitoring/reviews/:id/approve
+ */
+workspaceRouter.post(
+  '/monitoring/reviews/:id/approve',
+  requireWorkspaceContext({ minRole: 'editor' }),
+  async (req: AuthenticatedWorkspaceRequest, res: Response) => {
+    try {
+      const result = await approveWorkspaceChangeReview(req.workspace!.id, req.params.id);
+      if (!result.ok) {
+        res.status(400).json(result);
+        return;
+      }
+      res.json(result);
+    } catch (err: any) {
+      res.status(500).json({ ok: false, error: err.message || 'Error approving change review' });
+    }
+  }
+);
+
+/**
+ * POST /api/monitoring/reviews/:id/reject
+ */
+workspaceRouter.post(
+  '/monitoring/reviews/:id/reject',
+  requireWorkspaceContext({ minRole: 'editor' }),
+  async (req: AuthenticatedWorkspaceRequest, res: Response) => {
+    try {
+      const result = await rejectWorkspaceChangeReview(req.workspace!.id, req.params.id);
+      if (!result.ok) {
+        res.status(400).json(result);
+        return;
+      }
+      res.json(result);
+    } catch (err: any) {
+      res.status(500).json({ ok: false, error: err.message || 'Error rejecting change review' });
+    }
+  }
+);
+
+/**
+ * GET /api/monitoring/price-approvals
+ * Lists price changes pending manual approval.
+ */
+workspaceRouter.get(
+  '/monitoring/price-approvals',
+  requireWorkspaceContext({ minRole: 'viewer' }),
+  async (req: AuthenticatedWorkspaceRequest, res: Response) => {
+    try {
+      const history = await listWorkspacePriceHistory(req.workspace!.id);
+      const pending = history.filter((h) => h.status === 'pending_approval');
+      res.json({ ok: true, pendingApprovals: pending });
+    } catch (err: any) {
+      res.status(500).json({ ok: false, error: err.message || 'Error listing pending price approvals' });
+    }
+  }
+);
+
+/**
+ * POST /api/monitoring/price-approvals/:id/approve
+ */
+workspaceRouter.post(
+  '/monitoring/price-approvals/:id/approve',
+  requireWorkspaceContext({ minRole: 'editor' }),
+  async (req: AuthenticatedWorkspaceRequest, res: Response) => {
+    try {
+      const result = await approveWorkspacePriceChange(req.workspace!.id, req.params.id);
+      if (!result.ok) {
+        res.status(400).json(result);
+        return;
+      }
+      res.json(result);
+    } catch (err: any) {
+      res.status(500).json({ ok: false, error: err.message || 'Error approving price change' });
+    }
+  }
+);
+
+/**
+ * POST /api/monitoring/price-approvals/:id/reject
+ */
+workspaceRouter.post(
+  '/monitoring/price-approvals/:id/reject',
+  requireWorkspaceContext({ minRole: 'editor' }),
+  async (req: AuthenticatedWorkspaceRequest, res: Response) => {
+    try {
+      const result = await rejectWorkspacePriceChange(req.workspace!.id, req.params.id);
+      if (!result.ok) {
+        res.status(400).json(result);
+        return;
+      }
+      res.json(result);
+    } catch (err: any) {
+      res.status(500).json({ ok: false, error: err.message || 'Error rejecting price change' });
+    }
+  }
+);
+
+/**
+ * GET /api/notifications
+ */
+workspaceRouter.get(
+  '/notifications',
+  requireWorkspaceContext({ minRole: 'viewer' }),
+  async (req: AuthenticatedWorkspaceRequest, res: Response) => {
+    try {
+      const unreadOnly = req.query.unreadOnly === 'true';
+      const severity = req.query.severity as string;
+      const notifications = await listWorkspaceNotifications(req.workspace!.id, { unreadOnly, severity });
+      res.json({ ok: true, notifications });
+    } catch (err: any) {
+      res.status(500).json({ ok: false, error: err.message || 'Error listing notifications' });
+    }
+  }
+);
+
+/**
+ * PUT /api/notifications/:id/read
+ */
+workspaceRouter.put(
+  '/notifications/:id/read',
+  requireWorkspaceContext({ minRole: 'viewer' }),
+  async (req: AuthenticatedWorkspaceRequest, res: Response) => {
+    try {
+      const ok = await markWorkspaceNotificationRead(req.workspace!.id, req.params.id);
+      res.json({ ok });
+    } catch (err: any) {
+      res.status(500).json({ ok: false, error: err.message || 'Error marking notification read' });
+    }
+  }
+);
+
+/**
+ * PUT /api/notifications/:id/resolve
+ */
+workspaceRouter.put(
+  '/notifications/:id/resolve',
+  requireWorkspaceContext({ minRole: 'editor' }),
+  async (req: AuthenticatedWorkspaceRequest, res: Response) => {
+    try {
+      const ok = await resolveWorkspaceNotification(req.workspace!.id, req.params.id);
+      res.json({ ok });
+    } catch (err: any) {
+      res.status(500).json({ ok: false, error: err.message || 'Error resolving notification' });
+    }
+  }
+);
+
+/**
+ * POST /api/notifications/mark-all-read
+ */
+workspaceRouter.post(
+  '/notifications/mark-all-read',
+  requireWorkspaceContext({ minRole: 'viewer' }),
+  async (req: AuthenticatedWorkspaceRequest, res: Response) => {
+    try {
+      const count = await markAllWorkspaceNotificationsRead(req.workspace!.id);
+      res.json({ ok: true, count });
+    } catch (err: any) {
+      res.status(500).json({ ok: false, error: err.message || 'Error marking all notifications read' });
+    }
+  }
+);
+
+/**
+ * GET /api/monitoring/sync-events
+ */
+workspaceRouter.get(
+  '/monitoring/sync-events',
+  requireWorkspaceContext({ minRole: 'viewer' }),
+  async (req: AuthenticatedWorkspaceRequest, res: Response) => {
+    try {
+      const productId = req.query.productId as string;
+      const events = await listWorkspaceEbaySyncEvents(req.workspace!.id, productId);
+      res.json({ ok: true, events });
+    } catch (err: any) {
+      res.status(500).json({ ok: false, error: err.message || 'Error listing sync events' });
+    }
+  }
+);
+
+/**
+ * GET /api/monitoring/jobs
+ */
+workspaceRouter.get(
+  '/monitoring/jobs',
+  requireWorkspaceContext({ minRole: 'viewer' }),
+  async (req: AuthenticatedWorkspaceRequest, res: Response) => {
+    try {
+      const jobs = await listWorkspaceMonitoringJobs(req.workspace!.id);
+      res.json({ ok: true, jobs });
+    } catch (err: any) {
+      res.status(500).json({ ok: false, error: err.message || 'Error listing monitoring jobs' });
+    }
+  }
+);
+

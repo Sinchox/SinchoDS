@@ -50,6 +50,18 @@ export const Scraper: React.FC<ScraperProps> = ({
   const [zenrowsConfigured, setZenrowsConfigured] = useState(false);
   const [zenrowsJsRender, setZenrowsJsRender] = useState(false);
 
+  // Single URL direct import state
+  const [isSingleImporting, setIsSingleImporting] = useState(false);
+  const [singleImportMessage, setSingleImportMessage] = useState<{
+    ok: boolean;
+    message: string;
+    isDuplicate?: boolean;
+  } | null>(null);
+
+  // Background import jobs state
+  const [activeBackgroundJob, setActiveBackgroundJob] = useState<any | null>(null);
+  const [isStartingJob, setIsStartingJob] = useState(false);
+
   useEffect(() => {
     fetch('/api/zenrows/status')
       .then((res) => res.json())
@@ -60,6 +72,23 @@ export const Scraper: React.FC<ScraperProps> = ({
       })
       .catch(() => {});
   }, []);
+
+  // Poll background job if active
+  useEffect(() => {
+    if (!activeBackgroundJob || activeBackgroundJob.status === 'completed' || activeBackgroundJob.status === 'failed') return;
+    const timer = setInterval(async () => {
+      try {
+        const res = await fetch(`/api/imports/jobs/${activeBackgroundJob.id}`);
+        const data = await res.json();
+        if (data.ok && data.job) {
+          setActiveBackgroundJob(data.job);
+        }
+      } catch {
+        // ignore
+      }
+    }, 2000);
+    return () => clearInterval(timer);
+  }, [activeBackgroundJob]);
 
   // Sitemap discovery state
   const [sitemapUrl, setSitemapUrl] = useState('https://www.pluspowersupplements.com/sitemap.xml');
@@ -107,7 +136,16 @@ export const Scraper: React.FC<ScraperProps> = ({
     let duplicateCount = 0;
 
     for (const line of lines) {
-      if (!isValidProductUrl(line)) {
+      const isPP = isValidProductUrl(line);
+      let isValidGeneric = false;
+      try {
+        const u = new URL(line);
+        isValidGeneric = (u.protocol === 'http:' || u.protocol === 'https:') && u.pathname.length > 1;
+      } catch {
+        isValidGeneric = false;
+      }
+
+      if (!isPP && !isValidGeneric) {
         invalidCount++;
         continue;
       }
@@ -122,6 +160,80 @@ export const Scraper: React.FC<ScraperProps> = ({
     if (validNewUrls.length > 0) {
       setUrlQueue((prev) => [...prev, ...validNewUrls]);
       setUrlInput('');
+    }
+  };
+
+  const handleSingleUrlImport = async () => {
+    const firstLine = urlInput.trim().split('\n')[0]?.trim();
+    if (!firstLine) return;
+
+    setIsSingleImporting(true);
+    setSingleImportMessage(null);
+
+    try {
+      const res = await fetch('/api/products/import-url', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          url: firstLine,
+          fetchMethod: fetchProvider,
+          jsRender: fetchProvider === 'zenrows' ? zenrowsJsRender : false,
+        }),
+      });
+
+      const data = await res.json();
+      if (data.ok && data.product) {
+        data.product.status = 'draft';
+        await onSaveProduct(data.product);
+        setSingleImportMessage({
+          ok: true,
+          message: `Success: Imported "${data.product.title}" (${data.product.variants?.length || 0} variants) as Draft.`,
+        });
+        setUrlInput('');
+      } else if (data.isDuplicate) {
+        setSingleImportMessage({
+          ok: false,
+          isDuplicate: true,
+          message: data.error || 'Duplicate: Already imported in this workspace.',
+        });
+      } else {
+        setSingleImportMessage({
+          ok: false,
+          message: data.error || 'Import failed.',
+        });
+      }
+    } catch (err: any) {
+      setSingleImportMessage({
+        ok: false,
+        message: err.message || 'Network error during import',
+      });
+    } finally {
+      setIsSingleImporting(false);
+    }
+  };
+
+  const handleStartBackgroundJob = async () => {
+    if (urlQueue.length === 0) return;
+    setIsStartingJob(true);
+    try {
+      const res = await fetch('/api/imports/jobs', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          urls: urlQueue,
+          fetchMethod: fetchProvider,
+          jsRender: fetchProvider === 'zenrows' ? zenrowsJsRender : false,
+        }),
+      });
+      const data = await res.json();
+      if (data.ok && data.job) {
+        setActiveBackgroundJob(data.job);
+        setUrlQueue([]);
+      }
+    } catch (err) {
+      console.error('Error starting background job:', err);
+    } finally {
+      setIsStartingJob(false);
     }
   };
 
@@ -403,25 +515,106 @@ export const Scraper: React.FC<ScraperProps> = ({
           />
 
           <div className="flex flex-wrap items-center justify-between gap-2">
-            <button
-              onClick={() => handleAddUrls(urlInput)}
-              disabled={!urlInput.trim() || isRunning}
-              className="px-4 py-2 bg-emerald-600 hover:bg-emerald-500 disabled:opacity-50 text-white rounded-xl text-xs font-semibold inline-flex items-center space-x-1.5 transition-all shadow-sm"
-            >
-              <Plus className="w-3.5 h-3.5" />
-              <span>Add to Queue</span>
-            </button>
+            <div className="flex flex-wrap items-center gap-2">
+              <button
+                onClick={() => handleAddUrls(urlInput)}
+                disabled={!urlInput.trim() || isRunning}
+                className="px-3.5 py-2 bg-emerald-600 hover:bg-emerald-500 disabled:opacity-50 text-white rounded-xl text-xs font-semibold inline-flex items-center space-x-1.5 transition-all shadow-sm"
+              >
+                <Plus className="w-3.5 h-3.5" />
+                <span>Add to Queue</span>
+              </button>
+
+              <button
+                onClick={handleSingleUrlImport}
+                disabled={!urlInput.trim() || isSingleImporting}
+                className="px-3.5 py-2 bg-indigo-600 hover:bg-indigo-500 disabled:opacity-50 text-white rounded-xl text-xs font-semibold inline-flex items-center space-x-1.5 transition-all shadow-sm"
+                title="Imports first URL immediately into catalogue as Draft"
+              >
+                <RefreshCw className={`w-3.5 h-3.5 ${isSingleImporting ? 'animate-spin' : ''}`} />
+                <span>{isSingleImporting ? 'Importing Draft...' : 'Import URL Direct as Draft'}</span>
+              </button>
+            </div>
 
             {urlQueue.length > 0 && !isRunning && (
-              <button
-                onClick={handleClearQueue}
-                className="px-3 py-2 bg-slate-800 hover:bg-slate-700 text-slate-400 hover:text-white rounded-xl text-xs font-medium inline-flex items-center space-x-1"
-              >
-                <Trash2 className="w-3.5 h-3.5" />
-                <span>Clear Queue ({urlQueue.length})</span>
-              </button>
+              <div className="flex items-center space-x-2">
+                <button
+                  onClick={handleStartBackgroundJob}
+                  disabled={isStartingJob}
+                  className="px-3 py-2 bg-purple-600 hover:bg-purple-500 text-white rounded-xl text-xs font-semibold inline-flex items-center space-x-1 shadow-sm"
+                  title="Executes in server background without waiting for browser"
+                >
+                  <Layers className="w-3.5 h-3.5" />
+                  <span>Start Background Job ({urlQueue.length})</span>
+                </button>
+
+                <button
+                  onClick={handleClearQueue}
+                  className="px-3 py-2 bg-slate-800 hover:bg-slate-700 text-slate-400 hover:text-white rounded-xl text-xs font-medium inline-flex items-center space-x-1"
+                >
+                  <Trash2 className="w-3.5 h-3.5" />
+                  <span>Clear Queue ({urlQueue.length})</span>
+                </button>
+              </div>
             )}
           </div>
+
+          {/* Single Import Message Feedback */}
+          {singleImportMessage && (
+            <div
+              className={`p-3 rounded-xl border text-xs flex items-center space-x-2 animate-in fade-in ${
+                singleImportMessage.ok
+                  ? 'bg-emerald-950/40 border-emerald-800/60 text-emerald-300'
+                  : singleImportMessage.isDuplicate
+                  ? 'bg-amber-950/40 border-amber-800/60 text-amber-300'
+                  : 'bg-rose-950/40 border-rose-800/60 text-rose-300'
+              }`}
+            >
+              {singleImportMessage.ok ? (
+                <CheckCircle2 className="w-4 h-4 text-emerald-400 flex-shrink-0" />
+              ) : singleImportMessage.isDuplicate ? (
+                <AlertCircle className="w-4 h-4 text-amber-400 flex-shrink-0" />
+              ) : (
+                <XCircle className="w-4 h-4 text-rose-400 flex-shrink-0" />
+              )}
+              <span>{singleImportMessage.message}</span>
+            </div>
+          )}
+
+          {/* Active Background Job Tracker */}
+          {activeBackgroundJob && (
+            <div className="p-3 bg-purple-950/30 border border-purple-800/50 rounded-xl space-y-2 text-xs">
+              <div className="flex items-center justify-between">
+                <span className="font-bold text-purple-300 flex items-center space-x-1.5">
+                  <Layers className="w-4 h-4 text-purple-400" />
+                  <span>Background Import Job: {activeBackgroundJob.id}</span>
+                </span>
+                <span className="px-2 py-0.5 rounded-full bg-purple-800/60 text-purple-200 font-semibold text-[10px] uppercase">
+                  {activeBackgroundJob.status}
+                </span>
+              </div>
+              <div className="w-full bg-slate-950 rounded-full h-2 overflow-hidden border border-slate-800">
+                <div
+                  className="bg-purple-500 h-2 transition-all duration-300"
+                  style={{
+                    width: `${
+                      activeBackgroundJob.total > 0
+                        ? Math.round((activeBackgroundJob.completed / activeBackgroundJob.total) * 100)
+                        : 0
+                    }%`,
+                  }}
+                />
+              </div>
+              <div className="flex items-center justify-between text-[11px] text-slate-400">
+                <span>Progress: {activeBackgroundJob.completed} / {activeBackgroundJob.total}</span>
+                <div className="flex items-center space-x-3">
+                  <span className="text-emerald-400 font-semibold">✓ {activeBackgroundJob.successful} success</span>
+                  <span className="text-amber-400 font-semibold">⚠ {activeBackgroundJob.duplicates} duplicate</span>
+                  <span className="text-rose-400 font-semibold">✗ {activeBackgroundJob.failed} failed</span>
+                </div>
+              </div>
+            </div>
+          )}
         </div>
 
         {/* Discovery & Sitemap Panel */}

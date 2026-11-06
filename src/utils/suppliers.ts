@@ -5,6 +5,7 @@ import {
   isValidProductUrl as pluspowerIsValidUrl,
   isCloudflareChallenge as pluspowerIsCloudflare,
   ALLOWED_HOSTS as PLUSPOWER_HOSTS,
+  parseProductWithSupplierFallback,
 } from './parser.js';
 
 export interface SupplierConnector {
@@ -72,17 +73,74 @@ const CONNECTOR_REGISTRY: Record<string, SupplierConnector> = {
   pluspower: PlusPowerConnector,
 };
 
-export function getSupplierConnector(supplierId: string): SupplierConnector | null {
-  return CONNECTOR_REGISTRY[supplierId] || null;
+export function createGenericConnector(supplier: Supplier): SupplierConnector {
+  let allowedHosts: string[] = [];
+  try {
+    const host = new URL(supplier.baseUrl).hostname.toLowerCase();
+    allowedHosts = [host];
+  } catch {
+    allowedHosts = [];
+  }
+  return {
+    id: supplier.id,
+    name: supplier.name,
+    baseUrl: supplier.baseUrl,
+    allowedHosts,
+    validateUrl(url: string): boolean {
+      try {
+        const u = new URL(url);
+        return allowedHosts.some((h) => u.hostname.toLowerCase().includes(h));
+      } catch {
+        return false;
+      }
+    },
+    extractFromHtml(html: string, url: string, importSource = 'html_import'): Product {
+      return parseProductWithSupplierFallback(html, url, supplier, undefined, importSource as any);
+    },
+    extractVariants(html: string): ProductVariant[] {
+      const prod = parseProductWithSupplierFallback(html, '', supplier);
+      return prod.variants || [];
+    },
+    checkCloudflare(html: string, statusCode?: number, headers?: Record<string, string>): boolean {
+      return pluspowerIsCloudflare(html, statusCode, headers);
+    },
+    testConnectivity: async () => {
+      return { ok: true, message: `Connettore ${supplier.name} pronto.` };
+    },
+  };
 }
 
-export function detectSupplierFromUrl(url: string): SupplierConnector | null {
+export function getSupplierConnector(supplierId: string, customSuppliers?: Supplier[]): SupplierConnector | null {
+  if (CONNECTOR_REGISTRY[supplierId]) {
+    return CONNECTOR_REGISTRY[supplierId];
+  }
+  if (customSuppliers) {
+    const s = customSuppliers.find((cs) => cs.id === supplierId);
+    if (s) return createGenericConnector(s);
+  }
+  return null;
+}
+
+export function detectSupplierFromUrl(url: string, suppliers?: Supplier[]): SupplierConnector | null {
   try {
     const parsed = new URL(url);
     const host = parsed.hostname.toLowerCase();
     for (const connector of Object.values(CONNECTOR_REGISTRY)) {
       if (connector.allowedHosts.some((h) => host.includes(h.toLowerCase()))) {
         return connector;
+      }
+    }
+    if (suppliers) {
+      for (const s of suppliers) {
+        if (!s.baseUrl) continue;
+        try {
+          const sHost = new URL(s.baseUrl).hostname.toLowerCase();
+          if (host.includes(sHost)) {
+            return createGenericConnector(s);
+          }
+        } catch {
+          // ignore
+        }
       }
     }
   } catch {

@@ -19,7 +19,7 @@ import {
   ArrowRight,
   Eye,
 } from 'lucide-react';
-import { isCloudflareChallenge, extractProductFromHtml, CLOUDFLARE_ERROR_MESSAGE } from '../utils/parser.js';
+import { isCloudflareChallenge, parseProductWithSupplierFallback, CLOUDFLARE_ERROR_MESSAGE } from '../utils/parser.js';
 
 interface HtmlImportProps {
   onSaveProduct: (product: Product) => Promise<{ ok: boolean; product: Product }>;
@@ -107,7 +107,9 @@ export const HtmlImport: React.FC<HtmlImportProps> = ({
       }
 
       const url = productUrl.trim() || 'https://www.pluspowersupplements.com/product';
-      const extracted = extractProductFromHtml(htmlSource, url, 'html_import');
+      const extracted = parseProductWithSupplierFallback(htmlSource, url, undefined, undefined, 'html_import');
+      extracted.status = 'draft';
+      extracted.ebay_status = 'not_listed';
 
       setParsedProduct(extracted);
     } catch (err: any) {

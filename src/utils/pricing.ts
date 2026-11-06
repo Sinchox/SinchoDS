@@ -18,6 +18,19 @@ export const DEFAULT_PRICING_RULE: PricingRule = {
   vatRatePercent: 22, // Standard Italian VAT (IVA 22%)
 };
 
+export interface PriceChangeEvaluation {
+  action: 'no_change' | 'auto_recalculated' | 'pending_approval' | 'needs_approval' | 'rejected_invalid';
+  oldCost: number;
+  newCost: number;
+  oldSellingPrice: number;
+  newSellingPrice: number;
+  calculation: PricingCalculation;
+  isPriceIncrease: boolean;
+  isPriceDecrease: boolean;
+  minProfitPreserved: boolean;
+  reason: string;
+}
+
 /**
  * Calculates selling price, fees, and profit margins.
  * Formula:
@@ -31,7 +44,8 @@ export function calculateEbayPricing(
 
   const cost = Number(supplierCost) || 0;
   const shipping = Number(r.supplierShippingCost) || 0;
-  const totalCost = cost + shipping;
+  const packaging = Number(r.packagingCost) || 0;
+  const totalCost = cost + shipping + packaging;
 
   const ebayFeeRate = (Number(r.ebayFeePercent) || 0) / 100;
   const paymentFeeRate = (Number(r.paymentFeePercent) || 0) / 100;
@@ -53,9 +67,10 @@ export function calculateEbayPricing(
     : totalCost * 1.35;
 
   // Ensure minimum fixed profit is respected
+  const minFixedProfit = Number(r.targetFixedProfit) || 0;
   const profitAtMargin = recommendedPrice - (recommendedPrice * totalVariableRate + fixedFee) - totalCost;
-  if (profitAtMargin < r.targetFixedProfit) {
-    recommendedPrice = (totalCost + fixedFee + r.targetFixedProfit) / (1 - totalVariableRate);
+  if (profitAtMargin < minFixedProfit) {
+    recommendedPrice = (totalCost + fixedFee + minFixedProfit) / (1 - totalVariableRate);
   }
 
   // Round to standard 2 decimal format (e.g. .90 or .99 friendly retail)
@@ -70,12 +85,125 @@ export function calculateEbayPricing(
   return {
     supplierCost: Math.round(cost * 100) / 100,
     supplierShipping: Math.round(shipping * 100) / 100,
+    packagingCost: Math.round(packaging * 100) / 100,
     totalCost: Math.round(totalCost * 100) / 100,
     recommendedPrice,
     expectedEbayFees,
     expectedNetProfit,
     profitMarginPercent,
     breakEvenPrice: Math.round(breakEvenPrice * 100) / 100,
+  };
+}
+
+/**
+ * Evaluates a supplier price change according to dropshipping business rules:
+ * - Increases: auto-recalculates selling price ONLY if minimum profit is preserved.
+ *              If minimum profit cannot be preserved, generates an alert and does NOT apply it.
+ * - Decreases: calculates potential new selling price, but requires manual approval.
+ * - Enforces positive prices, non-negative costs, and zero-price listing prevention.
+ */
+export function evaluatePriceChange(params: {
+  currentSupplierCost: number | null | undefined;
+  newSupplierCost: number | null | undefined;
+  currentSellingPrice?: number | null | undefined;
+  pricingRule?: Partial<PricingRule>;
+  minimumProfitThreshold?: number;
+}): PriceChangeEvaluation {
+  const oldCost = Number(params.currentSupplierCost) || 0;
+  const newCost = Number(params.newSupplierCost) || 0;
+  const oldSelling = Number(params.currentSellingPrice) || 0;
+  const rule = params.pricingRule || {};
+  const minRequiredProfit = params.minimumProfitThreshold !== undefined
+    ? params.minimumProfitThreshold
+    : (rule.targetFixedProfit !== undefined ? rule.targetFixedProfit : 3.0);
+
+  // Guard against invalid/negative costs
+  if (newCost <= 0) {
+    const invalidCalc = calculateEbayPricing(0, rule);
+    return {
+      action: 'rejected_invalid',
+      oldCost,
+      newCost,
+      oldSellingPrice: oldSelling,
+      newSellingPrice: oldSelling,
+      calculation: invalidCalc,
+      isPriceIncrease: false,
+      isPriceDecrease: false,
+      minProfitPreserved: false,
+      reason: `Invalid supplier cost €${newCost}. Costs must be greater than zero. Existing price preserved.`,
+    };
+  }
+
+  const calculation = calculateEbayPricing(newCost, rule);
+  const newRecommendedPrice = calculation.recommendedPrice;
+
+  // Check if price changed
+  const costDiff = Math.round((newCost - oldCost) * 100) / 100;
+  if (Math.abs(costDiff) < 0.01) {
+    return {
+      action: 'no_change',
+      oldCost,
+      newCost,
+      oldSellingPrice: oldSelling,
+      newSellingPrice: oldSelling || newRecommendedPrice,
+      calculation,
+      isPriceIncrease: false,
+      isPriceDecrease: false,
+      minProfitPreserved: calculation.expectedNetProfit >= minRequiredProfit,
+      reason: 'Supplier cost unchanged.',
+    };
+  }
+
+  const isPriceIncrease = costDiff > 0;
+  const isPriceDecrease = costDiff < 0;
+
+  // Price Increase Rule
+  if (isPriceIncrease) {
+    // If the calculation produces expected profit >= minRequiredProfit, we automatically adjust selling price
+    const minProfitPreserved = calculation.expectedNetProfit >= minRequiredProfit && calculation.expectedNetProfit > 0;
+
+    if (minProfitPreserved) {
+      return {
+        action: 'auto_recalculated',
+        oldCost,
+        newCost,
+        oldSellingPrice: oldSelling,
+        newSellingPrice: newRecommendedPrice,
+        calculation,
+        isPriceIncrease: true,
+        isPriceDecrease: false,
+        minProfitPreserved: true,
+        reason: `Supplier cost increased from €${oldCost.toFixed(2)} to €${newCost.toFixed(2)} (+€${costDiff.toFixed(2)}). Selling price recalculated to €${newRecommendedPrice.toFixed(2)} preserving €${calculation.expectedNetProfit.toFixed(2)} net profit (${calculation.profitMarginPercent}% margin).`,
+      };
+    } else {
+      return {
+        action: 'needs_approval',
+        oldCost,
+        newCost,
+        oldSellingPrice: oldSelling,
+        newSellingPrice: oldSelling, // DO NOT apply new selling price automatically
+        calculation,
+        isPriceIncrease: true,
+        isPriceDecrease: false,
+        minProfitPreserved: false,
+        reason: `Supplier cost increased from €${oldCost.toFixed(2)} to €${newCost.toFixed(2)} (+€${costDiff.toFixed(2)}), but minimum profit threshold of €${minRequiredProfit.toFixed(2)} cannot be preserved (yields €${calculation.expectedNetProfit.toFixed(2)}). Price change held for manual review.`,
+      };
+    }
+  }
+
+  // Price Decrease Rule
+  // Requires manual approval before applying
+  return {
+    action: 'pending_approval',
+    oldCost,
+    newCost,
+    oldSellingPrice: oldSelling,
+    newSellingPrice: newRecommendedPrice,
+    calculation,
+    isPriceIncrease: false,
+    isPriceDecrease: true,
+    minProfitPreserved: calculation.expectedNetProfit >= minRequiredProfit,
+    reason: `Supplier cost decreased from €${oldCost.toFixed(2)} to €${newCost.toFixed(2)} (-€${Math.abs(costDiff).toFixed(2)}). Potential selling price €${newRecommendedPrice.toFixed(2)} (estimated net profit €${calculation.expectedNetProfit.toFixed(2)}) requires manual approval before applying.`,
   };
 }
 

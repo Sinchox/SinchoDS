@@ -1,5 +1,23 @@
-import { Product, Supplier, EbayListing, Order, PriceHistoryItem, ImportHistoryItem } from '../types.js';
+import {
+  Product,
+  ProductVariant,
+  Supplier,
+  SupplierParserConfig,
+  ImportJob,
+  ImportJobItem,
+  EbayListing,
+  Order,
+  PriceHistoryItem,
+  ImportHistoryItem,
+} from '../types.js';
 import { INITIAL_SUPPLIERS } from '../utils/suppliers.js';
+import {
+  parseProductWithSupplierFallback,
+  normalizeProductUrl,
+  isCloudflareChallenge,
+  CLOUDFLARE_ERROR_MESSAGE,
+} from '../utils/parser.js';
+import { fetchWithZenRows, isZenRowsConfigured } from '../utils/zenrows.js';
 import { WorkspaceRole, hasMinimumRole } from './workspaceMiddleware.js';
 import { getWorkspaceConfig, createServiceRoleClient } from './workspace.js';
 
@@ -24,6 +42,13 @@ const globalSuppliers: Supplier[] = INITIAL_SUPPLIERS.map((s) => ({
   ...s,
   // Ensure pluspower is designated as global
   id: s.id,
+  isGlobal: true,
+  is_global: true,
+  connected: true,
+  fetchMethod: 'direct',
+  jsRender: false,
+  shippingCost: 0,
+  stockThreshold: 5,
 }));
 
 // Scoped In-Memory Storage Partitions (Keyed strictly by workspaceId)
@@ -34,6 +59,7 @@ const workspaceEbayListingsStore = new Map<string, EbayListing[]>();
 const workspaceOrdersStore = new Map<string, Order[]>();
 const workspacePriceHistoryStore = new Map<string, PriceHistoryItem[]>();
 const workspaceImportHistoryStore = new Map<string, ImportHistoryItem[]>();
+const workspaceImportJobsStore = new Map<string, ImportJob[]>();
 const workspaceInfoStore = new Map<string, WorkspaceMetadata>();
 
 export function clearWorkspaceStore(): void {
@@ -44,6 +70,7 @@ export function clearWorkspaceStore(): void {
   workspaceOrdersStore.clear();
   workspacePriceHistoryStore.clear();
   workspaceImportHistoryStore.clear();
+  workspaceImportJobsStore.clear();
   workspaceInfoStore.clear();
 }
 
@@ -271,6 +298,116 @@ export async function bulkDeleteWorkspaceProducts(workspaceId: string, productId
 }
 
 // ==============================================================================
+// 1b. PRODUCT ARCHIVING & RESTORING
+// ==============================================================================
+
+export async function archiveWorkspaceProduct(workspaceId: string, productId: string): Promise<Product | null> {
+  const prod = await getWorkspaceProduct(workspaceId, productId);
+  if (!prod) return null;
+  prod.is_archived = true;
+  prod.status = 'archived';
+  await saveWorkspaceProduct(workspaceId, prod);
+  return prod;
+}
+
+export async function restoreWorkspaceProduct(workspaceId: string, productId: string): Promise<Product | null> {
+  const prod = await getWorkspaceProduct(workspaceId, productId);
+  if (!prod) return null;
+  prod.is_archived = false;
+  prod.status = 'draft';
+  await saveWorkspaceProduct(workspaceId, prod);
+  return prod;
+}
+
+export async function bulkArchiveWorkspaceProducts(workspaceId: string, productIds: string[]): Promise<number> {
+  let count = 0;
+  for (const id of productIds) {
+    const res = await archiveWorkspaceProduct(workspaceId, id);
+    if (res) count++;
+  }
+  return count;
+}
+
+export async function bulkRestoreWorkspaceProducts(workspaceId: string, productIds: string[]): Promise<number> {
+  let count = 0;
+  for (const id of productIds) {
+    const res = await restoreWorkspaceProduct(workspaceId, id);
+    if (res) count++;
+  }
+  return count;
+}
+
+// ==============================================================================
+// 1c. VARIANT MANAGEMENT (Never Flattened)
+// ==============================================================================
+
+export async function addWorkspaceProductVariant(
+  workspaceId: string,
+  productId: string,
+  variant: Partial<ProductVariant>
+): Promise<{ ok: boolean; product?: Product; error?: string }> {
+  const prod = await getWorkspaceProduct(workspaceId, productId);
+  if (!prod) return { ok: false, error: 'Product not found in this workspace' };
+
+  const newVariant: ProductVariant = {
+    id: crypto.randomUUID ? crypto.randomUUID() : Math.random().toString(36).substring(2, 15),
+    product_id: productId,
+    name: variant.name || 'Nuova Variante',
+    sku: variant.sku || null,
+    ean: variant.ean || null,
+    price: variant.price !== undefined ? variant.price : prod.price,
+    original_price: variant.original_price !== undefined ? variant.original_price : prod.original_price,
+    stock_quantity: variant.stock_quantity !== undefined ? variant.stock_quantity : 10,
+    availability: (variant.stock_quantity ?? 10) > 0 ? 'InStock' : 'OutOfStock',
+    expiry_date: variant.expiry_date || null,
+    available_online: variant.available_online ?? true,
+    raw_data: variant.raw_data || {},
+  };
+
+  prod.variants = prod.variants || [];
+  prod.variants.push(newVariant);
+  const saveRes = await saveWorkspaceProduct(workspaceId, prod);
+  return saveRes;
+}
+
+export async function updateWorkspaceProductVariant(
+  workspaceId: string,
+  productId: string,
+  variantId: string,
+  updates: Partial<ProductVariant>
+): Promise<{ ok: boolean; product?: Product; error?: string }> {
+  const prod = await getWorkspaceProduct(workspaceId, productId);
+  if (!prod) return { ok: false, error: 'Product not found in this workspace' };
+
+  prod.variants = prod.variants || [];
+  const idx = prod.variants.findIndex((v) => v.id === variantId || String(v.variant_id) === variantId);
+  if (idx < 0) return { ok: false, error: 'Variant not found' };
+
+  prod.variants[idx] = {
+    ...prod.variants[idx],
+    ...updates,
+    availability: (updates.stock_quantity ?? prod.variants[idx].stock_quantity ?? 0) > 0 ? 'InStock' : 'OutOfStock',
+    updated_at: new Date().toISOString(),
+  };
+
+  const saveRes = await saveWorkspaceProduct(workspaceId, prod);
+  return saveRes;
+}
+
+export async function deleteWorkspaceProductVariant(
+  workspaceId: string,
+  productId: string,
+  variantId: string
+): Promise<{ ok: boolean; product?: Product; error?: string }> {
+  const prod = await getWorkspaceProduct(workspaceId, productId);
+  if (!prod) return { ok: false, error: 'Product not found in this workspace' };
+
+  prod.variants = (prod.variants || []).filter((v) => v.id !== variantId && String(v.variant_id) !== variantId);
+  const saveRes = await saveWorkspaceProduct(workspaceId, prod);
+  return saveRes;
+}
+
+// ==============================================================================
 // 2. SUPPLIERS (Global Reusable + Workspace-Specific)
 // ==============================================================================
 
@@ -297,6 +434,23 @@ export async function listWorkspaceSuppliers(workspaceId: string): Promise<Suppl
             productCount: row.product_count || 0,
             failedCount: 0,
             description: row.description || '',
+            isGlobal: Boolean(row.is_global),
+            is_global: Boolean(row.is_global),
+            workspaceId: row.workspace_id,
+            workspace_id: row.workspace_id,
+            fetchMethod: row.config?.fetchMethod || row.config?.fetch_method || 'direct',
+            fetch_method: row.config?.fetchMethod || row.config?.fetch_method || 'direct',
+            jsRender: Boolean(row.config?.jsRender ?? row.config?.js_render ?? false),
+            js_render: Boolean(row.config?.jsRender ?? row.config?.js_render ?? false),
+            connected: row.config?.connected !== false,
+            shippingCost: row.config?.shippingCost ?? row.config?.shipping_cost ?? 0,
+            shipping_cost: row.config?.shippingCost ?? row.config?.shipping_cost ?? 0,
+            stockThreshold: row.config?.stockThreshold ?? row.config?.stock_threshold ?? 5,
+            stock_threshold: row.config?.stockThreshold ?? row.config?.stock_threshold ?? 5,
+            pricingRule: row.config?.pricingRule || row.config?.pricing_rule || undefined,
+            pricing_rule: row.config?.pricingRule || row.config?.pricing_rule || undefined,
+            parserConfig: row.config?.parserConfig || row.config?.parser_config || undefined,
+            parser_config: row.config?.parserConfig || row.config?.parser_config || undefined,
             supportedFeatures: row.config?.features || {
               sitemap: true,
               variants: true,
@@ -320,27 +474,126 @@ export async function listWorkspaceSuppliers(workspaceId: string): Promise<Suppl
 export async function saveWorkspaceSupplier(
   workspaceId: string,
   supplier: Supplier,
-  userRole: WorkspaceRole
+  userRole: WorkspaceRole = 'admin'
 ): Promise<{ ok: boolean; supplier?: Supplier; error?: string }> {
   if (!hasMinimumRole(userRole, 'manager')) {
     return { ok: false, error: 'Access Denied: Role manager or higher is required to manage suppliers.' };
   }
 
-  // Prevent modifying global suppliers
+  // Prevent modifying global suppliers directly
   const isGlobal = globalSuppliers.some((s) => s.id === supplier.id);
   if (isGlobal) {
     return { ok: false, error: 'Access Denied: Global reusable suppliers are system-wide and cannot be modified.' };
   }
 
+  const normalizedSupplier: Supplier = {
+    ...supplier,
+    id: supplier.id || (crypto.randomUUID ? crypto.randomUUID() : Math.random().toString(36).substring(2, 12)),
+    workspaceId,
+    workspace_id: workspaceId,
+    isGlobal: false,
+    is_global: false,
+    fetchMethod: supplier.fetchMethod || supplier.fetch_method || 'direct',
+    jsRender: supplier.jsRender ?? supplier.js_render ?? false,
+    connected: supplier.connected !== false,
+    shippingCost: supplier.shippingCost ?? supplier.shipping_cost ?? 0,
+    packagingCost: supplier.packagingCost ?? supplier.packaging_cost ?? 0,
+    packaging_cost: supplier.packagingCost ?? supplier.packaging_cost ?? 0,
+    defaultEbayQuantity: supplier.defaultEbayQuantity ?? supplier.default_ebay_quantity ?? 3,
+    default_ebay_quantity: supplier.defaultEbayQuantity ?? supplier.default_ebay_quantity ?? 3,
+    monitoringIntervalMinutes: supplier.monitoringIntervalMinutes ?? supplier.monitoring_interval_minutes ?? 360,
+    monitoring_interval_minutes: supplier.monitoringIntervalMinutes ?? supplier.monitoring_interval_minutes ?? 360,
+    stockThreshold: supplier.stockThreshold ?? supplier.stock_threshold ?? 5,
+    status: supplier.status || 'active',
+    productCount: supplier.productCount ?? 0,
+    failedCount: supplier.failedCount ?? 0,
+    lastSyncAt: supplier.lastSyncAt || new Date().toISOString(),
+    supportedFeatures: supplier.supportedFeatures || {
+      sitemap: true,
+      variants: true,
+      lotExpiry: true,
+      liveScraping: true,
+      htmlImport: true,
+    },
+  };
+
+  const config = getWorkspaceConfig();
+  if (config.supabaseUrl && config.serviceRoleKey) {
+    try {
+      const client = createServiceRoleClient(config.supabaseUrl, config.serviceRoleKey);
+      if (client) {
+        const payload = {
+          id: normalizedSupplier.id,
+          workspace_id: workspaceId,
+          name: normalizedSupplier.name,
+          base_url: normalizedSupplier.baseUrl,
+          logo_text: normalizedSupplier.logoText,
+          is_active: normalizedSupplier.status === 'active',
+          is_global: false,
+          description: normalizedSupplier.description,
+          config: {
+            features: normalizedSupplier.supportedFeatures,
+            fetchMethod: normalizedSupplier.fetchMethod,
+            jsRender: normalizedSupplier.jsRender,
+            connected: normalizedSupplier.connected,
+            shippingCost: normalizedSupplier.shippingCost,
+            stockThreshold: normalizedSupplier.stockThreshold,
+            pricingRule: normalizedSupplier.pricingRule || normalizedSupplier.pricing_rule,
+            parserConfig: normalizedSupplier.parserConfig || normalizedSupplier.parser_config,
+          },
+        };
+        await client.from('suppliers').upsert(payload, { onConflict: 'id' });
+      }
+    } catch {
+      // Fallback
+    }
+  }
+
   const customList = workspaceSuppliersStore.get(workspaceId) || [];
-  const existingIdx = customList.findIndex((s) => s.id === supplier.id);
+  const existingIdx = customList.findIndex((s) => s.id === normalizedSupplier.id);
   if (existingIdx >= 0) {
-    customList[existingIdx] = supplier;
+    customList[existingIdx] = normalizedSupplier;
   } else {
-    customList.push(supplier);
+    customList.push(normalizedSupplier);
   }
   workspaceSuppliersStore.set(workspaceId, customList);
 
+  return { ok: true, supplier: normalizedSupplier };
+}
+
+export async function toggleWorkspaceSupplierConnection(
+  workspaceId: string,
+  supplierId: string,
+  connected: boolean,
+  userRole: WorkspaceRole
+): Promise<{ ok: boolean; supplier?: Supplier; error?: string }> {
+  if (!hasMinimumRole(userRole, 'manager')) {
+    return { ok: false, error: 'Access Denied: Role manager or higher is required.' };
+  }
+
+  const customList = workspaceSuppliersStore.get(workspaceId) || [];
+  let supplier = customList.find((s) => s.id === supplierId);
+
+  if (!supplier) {
+    const globalS = globalSuppliers.find((s) => s.id === supplierId);
+    if (globalS) {
+      supplier = {
+        ...globalS,
+        connected,
+        status: connected ? 'active' : 'disabled',
+        workspaceId,
+        isGlobal: false,
+      };
+      customList.push(supplier);
+    } else {
+      return { ok: false, error: 'Supplier not found' };
+    }
+  } else {
+    supplier.connected = connected;
+    supplier.status = connected ? 'active' : 'disabled';
+  }
+
+  workspaceSuppliersStore.set(workspaceId, customList);
   return { ok: true, supplier };
 }
 
@@ -358,6 +611,18 @@ export async function deleteWorkspaceSupplier(
     return { ok: false, error: 'Access Denied: Global reusable suppliers cannot be deleted.' };
   }
 
+  const config = getWorkspaceConfig();
+  if (config.supabaseUrl && config.serviceRoleKey) {
+    try {
+      const client = createServiceRoleClient(config.supabaseUrl, config.serviceRoleKey);
+      if (client) {
+        await client.from('suppliers').delete().eq('id', supplierId).eq('workspace_id', workspaceId);
+      }
+    } catch {
+      // Fallback
+    }
+  }
+
   const customList = workspaceSuppliersStore.get(workspaceId) || [];
   const filtered = customList.filter((s) => s.id !== supplierId);
   if (filtered.length === customList.length) {
@@ -366,6 +631,359 @@ export async function deleteWorkspaceSupplier(
   workspaceSuppliersStore.set(workspaceId, filtered);
   return { ok: true };
 }
+
+// ==============================================================================
+// 2b. FETCHING & PARSING TEST MODE
+// ==============================================================================
+
+export async function fetchHtmlForWorkspace(
+  url: string,
+  fetchMethod: 'direct' | 'zenrows' = 'direct',
+  jsRender: boolean = false
+): Promise<{ ok: boolean; html?: string; error?: string }> {
+  if (fetchMethod === 'zenrows' && isZenRowsConfigured()) {
+    const res = await fetchWithZenRows(url, { jsRender });
+    if (res.ok && res.html) {
+      return { ok: true, html: res.html };
+    }
+  }
+
+  try {
+    const res = await fetch(url, {
+      headers: {
+        'User-Agent':
+          'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+        'Accept-Language': 'it-IT,it;q=0.9,en-US;q=0.8,en;q=0.7',
+      },
+    });
+
+    const html = await res.text();
+    if (isCloudflareChallenge(html, res.status)) {
+      if (fetchMethod !== 'zenrows' && isZenRowsConfigured()) {
+        const zRes = await fetchWithZenRows(url, { jsRender });
+        if (zRes.ok && zRes.html) {
+          return { ok: true, html: zRes.html };
+        }
+      }
+      return { ok: false, error: CLOUDFLARE_ERROR_MESSAGE };
+    }
+
+    if (!res.ok) {
+      return { ok: false, error: `HTTP ${res.status}: ${res.statusText}` };
+    }
+
+    return { ok: true, html };
+  } catch (err: any) {
+    return { ok: false, error: err.message || 'Network error fetching product page' };
+  }
+}
+
+export async function testSupplierParser(
+  workspaceId: string,
+  url: string,
+  supplierId?: string,
+  customConfig?: SupplierParserConfig,
+  fetchMethod: 'direct' | 'zenrows' = 'direct',
+  jsRender: boolean = false
+): Promise<{
+  ok: boolean;
+  product?: Product;
+  detectedFields?: {
+    title: string | null;
+    price: number | null;
+    brand: string | null;
+    sku: string | null;
+    ean: string | null;
+    variantsCount: number;
+    imagesCount: number;
+  };
+  error?: string;
+}> {
+  const suppliers = await listWorkspaceSuppliers(workspaceId);
+  const matchedSupplier = supplierId ? suppliers.find((s) => s.id === supplierId) : undefined;
+
+  const effectiveSupplier: Supplier = matchedSupplier
+    ? {
+        ...matchedSupplier,
+        parserConfig: customConfig || matchedSupplier.parserConfig,
+      }
+    : {
+        id: 'test_supplier',
+        name: 'Test Supplier',
+        baseUrl: url,
+        logoText: 'TST',
+        status: 'active',
+        lastSyncAt: null,
+        productCount: 0,
+        failedCount: 0,
+        description: 'Test Mode',
+        parserConfig: customConfig,
+        supportedFeatures: {
+          sitemap: true,
+          variants: true,
+          lotExpiry: true,
+          liveScraping: true,
+          htmlImport: true,
+        },
+      };
+
+  const method = fetchMethod || effectiveSupplier.fetchMethod || 'direct';
+  const render = jsRender ?? effectiveSupplier.jsRender ?? false;
+
+  const fetchRes = await fetchHtmlForWorkspace(url, method, render);
+  if (!fetchRes.ok || !fetchRes.html) {
+    return { ok: false, error: fetchRes.error || 'Failed to fetch product URL.' };
+  }
+
+  try {
+    const product = parseProductWithSupplierFallback(fetchRes.html, url, effectiveSupplier, suppliers);
+    return {
+      ok: true,
+      product,
+      detectedFields: {
+        title: product.title || null,
+        price: typeof product.price === 'number' ? product.price : null,
+        brand: product.brand || null,
+        sku: product.sku || null,
+        ean: product.ean || null,
+        variantsCount: product.variants?.length || 0,
+        imagesCount: product.images?.length || 0,
+      },
+    };
+  } catch (err: any) {
+    return { ok: false, error: err.message || 'Parser execution error' };
+  }
+}
+
+// ==============================================================================
+// 2c. PRODUCT IMPORTING (Single URL & Background Jobs with Duplicate Check)
+// ==============================================================================
+
+export async function importSingleProductUrl(
+  workspaceId: string,
+  url: string,
+  supplierId?: string,
+  fetchMethod: 'direct' | 'zenrows' = 'direct',
+  jsRender: boolean = false
+): Promise<{ ok: boolean; product?: Product; isDuplicate?: boolean; error?: string }> {
+  const normalizedUrl = normalizeProductUrl(url);
+
+  // 1. Workspace Duplicate Check: Check if URL already exists in this workspace
+  const existingProducts = await listWorkspaceProducts(workspaceId);
+  const duplicate = existingProducts.find((p) => normalizeProductUrl(p.url) === normalizedUrl);
+  if (duplicate) {
+    return {
+      ok: false,
+      isDuplicate: true,
+      error: `Duplicate product: This URL was already imported in this workspace (${duplicate.title}).`,
+      product: duplicate,
+    };
+  }
+
+  const suppliers = await listWorkspaceSuppliers(workspaceId);
+  const matchedSupplier = supplierId ? suppliers.find((s) => s.id === supplierId) : undefined;
+  const method = fetchMethod || matchedSupplier?.fetchMethod || 'direct';
+  const render = jsRender ?? matchedSupplier?.jsRender ?? false;
+
+  const fetchRes = await fetchHtmlForWorkspace(normalizedUrl, method, render);
+  if (!fetchRes.ok || !fetchRes.html) {
+    await addWorkspaceImportHistory(workspaceId, {
+      id: crypto.randomUUID ? crypto.randomUUID() : Math.random().toString(36).substring(2, 15),
+      url: normalizedUrl,
+      title: normalizedUrl,
+      source: 'live_scraper',
+      status: 'failed',
+      message: fetchRes.error || 'Fetch failure',
+      timestamp: new Date().toISOString(),
+      supplier_id: supplierId,
+    });
+    return { ok: false, error: fetchRes.error || 'Fetch failure' };
+  }
+
+  try {
+    const product = parseProductWithSupplierFallback(fetchRes.html, normalizedUrl, matchedSupplier, suppliers, 'live_scraper');
+    // Ensure Draft status and workspace scoping
+    product.workspace_id = workspaceId;
+    product.status = 'draft';
+    product.ebay_status = 'not_listed';
+
+    const saveRes = await saveWorkspaceProduct(workspaceId, product);
+    if (!saveRes.ok) {
+      return { ok: false, error: saveRes.error || 'Failed to save imported product.' };
+    }
+
+    await addWorkspaceImportHistory(workspaceId, {
+      id: crypto.randomUUID ? crypto.randomUUID() : Math.random().toString(36).substring(2, 15),
+      url: normalizedUrl,
+      title: product.title || 'Nuovo Prodotto',
+      source: 'live_scraper',
+      status: 'success',
+      message: `Imported successfully with ${product.variants?.length || 0} variants as Draft.`,
+      timestamp: new Date().toISOString(),
+      supplier_id: product.supplier_id,
+    });
+
+    return { ok: true, product: saveRes.product };
+  } catch (err: any) {
+    await addWorkspaceImportHistory(workspaceId, {
+      id: crypto.randomUUID ? crypto.randomUUID() : Math.random().toString(36).substring(2, 15),
+      url: normalizedUrl,
+      title: normalizedUrl,
+      source: 'live_scraper',
+      status: 'failed',
+      message: err.message || 'Parser error',
+      timestamp: new Date().toISOString(),
+      supplier_id: supplierId,
+    });
+    return { ok: false, error: err.message || 'Parser error' };
+  }
+}
+
+export function getWorkspaceImportJobs(workspaceId: string): ImportJob[] {
+  return [...(workspaceImportJobsStore.get(workspaceId) || [])];
+}
+
+export function getWorkspaceImportJob(workspaceId: string, jobId: string): ImportJob | null {
+  const jobs = workspaceImportJobsStore.get(workspaceId) || [];
+  return jobs.find((j) => j.id === jobId) || null;
+}
+
+export function createWorkspaceImportJob(
+  workspaceId: string,
+  urls: string[],
+  supplierId?: string,
+  fetchMethod: 'direct' | 'zenrows' = 'direct',
+  jsRender: boolean = false
+): ImportJob {
+  const cleanUrls = urls.map((u) => u.trim()).filter((u) => Boolean(u));
+  const job: ImportJob = {
+    id: 'job_' + (crypto.randomUUID ? crypto.randomUUID() : Math.random().toString(36).substring(2, 12)),
+    workspaceId,
+    status: 'running',
+    total: cleanUrls.length,
+    completed: 0,
+    successful: 0,
+    failed: 0,
+    duplicates: 0,
+    items: cleanUrls.map((u) => ({
+      url: u,
+      status: 'pending',
+      supplierId,
+    })),
+    createdAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
+  };
+
+  const list = workspaceImportJobsStore.get(workspaceId) || [];
+  list.unshift(job);
+  if (list.length > 25) list.pop();
+  workspaceImportJobsStore.set(workspaceId, list);
+
+  // Execute processing asynchronously in background so client disconnect does not abort job
+  processWorkspaceImportJob(job, supplierId, fetchMethod, jsRender).catch((err) => {
+    console.error(`Import job error (${job.id}):`, err);
+  });
+
+  return job;
+}
+
+async function processWorkspaceImportJob(
+  job: ImportJob,
+  supplierId?: string,
+  fetchMethod: 'direct' | 'zenrows' = 'direct',
+  jsRender: boolean = false
+): Promise<void> {
+  const suppliers = await listWorkspaceSuppliers(job.workspaceId);
+  const matchedSupplier = supplierId ? suppliers.find((s) => s.id === supplierId) : undefined;
+  const method = fetchMethod || matchedSupplier?.fetchMethod || 'direct';
+  const render = jsRender ?? matchedSupplier?.jsRender ?? false;
+
+  for (const item of job.items) {
+    item.status = 'processing';
+    job.updatedAt = new Date().toISOString();
+
+    const normalizedUrl = normalizeProductUrl(item.url);
+
+    // Duplicate check
+    const existingProducts = await listWorkspaceProducts(job.workspaceId);
+    const isDup = existingProducts.some((p) => normalizeProductUrl(p.url) === normalizedUrl);
+    if (isDup) {
+      item.status = 'duplicate';
+      item.isDuplicate = true;
+      item.error = 'Duplicate: already imported in this workspace.';
+      job.duplicates++;
+      job.completed++;
+      job.updatedAt = new Date().toISOString();
+      continue;
+    }
+
+    // Fetch
+    const fetchRes = await fetchHtmlForWorkspace(normalizedUrl, method, render);
+    if (!fetchRes.ok || !fetchRes.html) {
+      item.status = 'failed';
+      item.error = fetchRes.error || 'Fetch failure';
+      job.failed++;
+      job.completed++;
+      job.updatedAt = new Date().toISOString();
+
+      await addWorkspaceImportHistory(job.workspaceId, {
+        id: crypto.randomUUID ? crypto.randomUUID() : Math.random().toString(36).substring(2, 15),
+        url: normalizedUrl,
+        title: normalizedUrl,
+        source: 'live_scraper',
+        status: 'failed',
+        message: fetchRes.error || 'Fetch failure',
+        timestamp: new Date().toISOString(),
+        supplier_id: supplierId,
+      });
+      continue;
+    }
+
+    // Parse & Save
+    try {
+      const product = parseProductWithSupplierFallback(fetchRes.html, normalizedUrl, matchedSupplier, suppliers, 'live_scraper');
+      product.workspace_id = job.workspaceId;
+      product.status = 'draft';
+      product.ebay_status = 'not_listed';
+
+      const saveRes = await saveWorkspaceProduct(job.workspaceId, product);
+      if (saveRes.ok) {
+        item.status = 'success';
+        item.product = saveRes.product;
+        job.successful++;
+        job.completed++;
+
+        await addWorkspaceImportHistory(job.workspaceId, {
+          id: crypto.randomUUID ? crypto.randomUUID() : Math.random().toString(36).substring(2, 15),
+          url: normalizedUrl,
+          title: product.title || 'Nuovo Prodotto',
+          source: 'live_scraper',
+          status: 'success',
+          message: `Imported successfully with ${product.variants?.length || 0} variants as Draft.`,
+          timestamp: new Date().toISOString(),
+          supplier_id: product.supplier_id,
+        });
+      } else {
+        item.status = 'failed';
+        item.error = saveRes.error || 'Database save error';
+        job.failed++;
+        job.completed++;
+      }
+    } catch (err: any) {
+      item.status = 'failed';
+      item.error = err.message || 'Parsing error';
+      job.failed++;
+      job.completed++;
+    }
+
+    job.updatedAt = new Date().toISOString();
+  }
+
+  job.status = job.failed > 0 && job.successful === 0 ? 'failed' : 'completed';
+  job.updatedAt = new Date().toISOString();
+}
+
 
 // ==============================================================================
 // 3. EBAY ACCOUNTS & CREDENTIALS ISOLATION
@@ -687,6 +1305,61 @@ export async function recordWorkspacePriceChange(workspaceId: string, item: Pric
   const list = workspacePriceHistoryStore.get(workspaceId) || [];
   list.unshift(item);
   workspacePriceHistoryStore.set(workspaceId, list.slice(0, 500));
+}
+
+export async function approveWorkspacePriceChange(
+  workspaceId: string,
+  historyId: string
+): Promise<{ ok: boolean; historyItem?: PriceHistoryItem; product?: Product; error?: string }> {
+  const list = workspacePriceHistoryStore.get(workspaceId) || [];
+  const item = list.find((h) => h.id === historyId);
+  if (!item) return { ok: false, error: 'Price history record not found.' };
+
+  const prod = await getWorkspaceProduct(workspaceId, item.product_id);
+  if (!prod) return { ok: false, error: 'Associated product not found.' };
+
+  // Apply approved price change
+  item.status = 'applied';
+  if (item.new_price !== null) {
+    prod.price = item.new_price;
+  }
+  if (item.new_selling_price !== null && item.new_selling_price !== undefined) {
+    prod.calculated_selling_price = item.new_selling_price;
+  }
+
+  // If no remaining pending items for this product, clear pending_approval status
+  const pendingCount = list.filter((h) => h.product_id === prod.id && h.id !== historyId && h.status === 'pending_approval').length;
+  if (pendingCount === 0 && prod.monitoring_status === 'pending_approval') {
+    prod.monitoring_status = 'idle';
+  }
+
+  await saveWorkspaceProduct(workspaceId, prod);
+  workspacePriceHistoryStore.set(workspaceId, list);
+
+  return { ok: true, historyItem: item, product: prod };
+}
+
+export async function rejectWorkspacePriceChange(
+  workspaceId: string,
+  historyId: string
+): Promise<{ ok: boolean; historyItem?: PriceHistoryItem; error?: string }> {
+  const list = workspacePriceHistoryStore.get(workspaceId) || [];
+  const item = list.find((h) => h.id === historyId);
+  if (!item) return { ok: false, error: 'Price history record not found.' };
+
+  item.status = 'rejected';
+
+  const prod = await getWorkspaceProduct(workspaceId, item.product_id);
+  if (prod && prod.monitoring_status === 'pending_approval') {
+    const pendingCount = list.filter((h) => h.product_id === prod.id && h.id !== historyId && h.status === 'pending_approval').length;
+    if (pendingCount === 0) {
+      prod.monitoring_status = 'idle';
+      await saveWorkspaceProduct(workspaceId, prod);
+    }
+  }
+
+  workspacePriceHistoryStore.set(workspaceId, list);
+  return { ok: true, historyItem: item };
 }
 
 export async function listWorkspaceImportHistory(workspaceId: string): Promise<ImportHistoryItem[]> {

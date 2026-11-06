@@ -283,6 +283,50 @@ export default function App() {
     setListings((prev) => prev.filter((l) => l.id !== id));
   };
 
+  const handleArchiveProduct = async (id: string) => {
+    try {
+      await fetch(`/api/products/${id}/archive`, { method: 'PUT' });
+    } catch {}
+    setProducts((prev) =>
+      prev.map((p) => (p.id === id ? { ...p, is_archived: true, status: 'archived' } : p))
+    );
+  };
+
+  const handleRestoreProduct = async (id: string) => {
+    try {
+      await fetch(`/api/products/${id}/restore`, { method: 'PUT' });
+    } catch {}
+    setProducts((prev) =>
+      prev.map((p) => (p.id === id ? { ...p, is_archived: false, status: 'draft' } : p))
+    );
+  };
+
+  const handleBulkArchive = async (ids: string[]) => {
+    try {
+      await fetch('/api/products/bulk-archive', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ ids }),
+      });
+    } catch {}
+    setProducts((prev) =>
+      prev.map((p) => (ids.includes(p.id) ? { ...p, is_archived: true, status: 'archived' } : p))
+    );
+  };
+
+  const handleBulkRestore = async (ids: string[]) => {
+    try {
+      await fetch('/api/products/bulk-restore', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ ids }),
+      });
+    } catch {}
+    setProducts((prev) =>
+      prev.map((p) => (ids.includes(p.id) ? { ...p, is_archived: false, status: 'draft' } : p))
+    );
+  };
+
   // Supplier Handlers
   const handleToggleSupplier = (id: string) => {
     setSuppliers((prev) =>
@@ -292,6 +336,22 @@ export default function App() {
 
   const handleAddSupplier = (supplier: Supplier) => {
     setSuppliers((prev) => [...prev, supplier]);
+  };
+
+  const handleUpdateSupplier = (supplier: Supplier) => {
+    setSuppliers((prev) => {
+      const idx = prev.findIndex((s) => s.id === supplier.id);
+      if (idx >= 0) {
+        const updated = [...prev];
+        updated[idx] = supplier;
+        return updated;
+      }
+      return [...prev, supplier];
+    });
+  };
+
+  const handleDeleteSupplier = (id: string) => {
+    setSuppliers((prev) => prev.filter((s) => s.id !== id));
   };
 
   const handleClearHistory = () => {
@@ -338,6 +398,10 @@ export default function App() {
             onUpdateProduct={handleUpdateProduct}
             onDeleteProduct={handleDeleteProduct}
             onBulkDelete={handleBulkDelete}
+            onArchiveProduct={handleArchiveProduct}
+            onRestoreProduct={handleRestoreProduct}
+            onBulkArchive={handleBulkArchive}
+            onBulkRestore={handleBulkRestore}
             onOpenListingBuilder={(p) => setListingBuilderProduct(p)}
           />
         )}
@@ -347,6 +411,8 @@ export default function App() {
             suppliers={suppliers}
             onToggleSupplier={handleToggleSupplier}
             onAddSupplier={handleAddSupplier}
+            onUpdateSupplier={handleUpdateSupplier}
+            onDeleteSupplier={handleDeleteSupplier}
             setCurrentPage={setCurrentPage}
           />
         )}
